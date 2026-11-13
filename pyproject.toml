@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenlens"
+version = "0.1.0"
+description = "Local-first multi-agent AI coding token analytics & visualization desktop dashboard"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+  { name = "TokenLens Contributors" }
+]
+keywords = ["ai-agent", "token-usage", "claude-code", "codex", "opencode", "antigravity", "vscode", "qoder", "analytics"]
+dependencies = []
+
+[project.optional-dependencies]
+zstd = ["zstandard>=0.22.0"]
+
+[project.scripts]
+tokenlens = "tokenlens.server:main"
+
+[tool.setuptools.packages.find]
+include = ["tokenlens*"]
+
+[tool.setuptools.package-data]
+tokenlens = ["static/*"]
