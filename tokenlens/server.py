@@ -9,6 +9,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -186,7 +187,7 @@ def _find_free_port(preferred: int = 7890) -> int:
 
 
 def _open_desktop_window(url: str) -> None:
-    """Try opening in native-like standalone desktop app window via Edge/Chrome --app mode."""
+    """Try opening in native-like standalone desktop app window across Windows/macOS/Linux."""
     candidates: list[str] = []
     if os.name == "nt":
         for p in (
@@ -197,6 +198,19 @@ def _open_desktop_window(url: str) -> None:
         ):
             if os.path.exists(p):
                 candidates.append(p)
+    elif sys.platform == "darwin":
+        mac_apps = (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        )
+        for p in mac_apps:
+            if os.path.exists(p):
+                candidates.append(p)
+            user_app = Path.home() / p.lstrip("/")
+            if user_app.exists():
+                candidates.append(str(user_app))
     for name in ("msedge", "google-chrome", "chromium", "chrome"):
         found = shutil.which(name)
         if found:

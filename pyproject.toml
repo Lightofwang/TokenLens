@@ -12,7 +12,13 @@ requires-python = ">=3.10"
 authors = [
   { name = "TokenLens Contributors" }
 ]
-keywords = ["ai-agent", "token-usage", "claude-code", "codex", "opencode", "antigravity", "vscode", "qoder", "analytics"]
+keywords = ["ai-agent", "token-usage", "claude-code", "codex", "opencode", "antigravity", "vscode", "qoder", "analytics", "macos", "apple-silicon"]
+classifiers = [
+  "Operating System :: OS Independent",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+]
 dependencies = []
 
 [project.optional-dependencies]

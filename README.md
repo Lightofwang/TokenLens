@@ -37,9 +37,12 @@
    ```bash
    git clone https://github.com/Lightofwang/TokenLens.git
    cd TokenLens
-   python -m tokenlens
+   python3 -m tokenlens
    ```
-   Windows 用户也可直接双击 [`start_tokenlens.bat`](./start_tokenlens.bat)，软件会自动优先通过 Edge / Chrome `--app` 独立桌面窗口模式打开（或回退到默认浏览器）。
+   - **Windows 用户**：双击 [`start_tokenlens.bat`](./start_tokenlens.bat)，会自动优先通过 Edge / Chrome `--app` 独立桌面窗口打开。
+   - **macOS (Apple Silicon M1/M2/M3/M4 & Intel) 用户**：
+     - 首次运行可执行 `chmod +x start_tokenlens.command`，之后直接在 Finder 双击 [`start_tokenlens.command`](./start_tokenlens.command) 即可独立窗口启动（自动识别 `/opt/homebrew/bin/python3`）。
+     - 若需读取 Codex 归档的 `.jsonl.zst` 压缩日志且系统 Python 版本低于 `3.14`，建议执行一次 `brew install zstd` 或 `pip3 install zstandard`。
 
 2. **安装为全局命令**：
    ```bash

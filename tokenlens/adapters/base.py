@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -53,11 +54,27 @@ def get_app_data_dirs() -> list[Path]:
             val = os.environ.get(env_key)
             if val:
                 dirs.append(Path(val))
-    elif os.name == "posix":
+    elif sys.platform == "darwin":
         dirs.append(home / "Library" / "Application Support")
         dirs.append(home / ".config")
         dirs.append(home / ".local" / "share")
-    return dirs
+    elif os.name == "posix":
+        xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+        xdg_data = os.environ.get("XDG_DATA_HOME")
+        if xdg_cfg:
+            dirs.append(Path(xdg_cfg))
+        if xdg_data:
+            dirs.append(Path(xdg_data))
+        dirs.append(home / ".config")
+        dirs.append(home / ".local" / "share")
+    # Deduplicate preserving order
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            unique.append(d)
+    return unique
 
 
 def find_existing_paths(candidates: Iterable[Path]) -> list[Path]:

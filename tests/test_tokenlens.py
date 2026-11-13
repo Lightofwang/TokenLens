@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
+from unittest.mock import patch
 
-from tokenlens.adapters.base import local_tz
+from tokenlens.adapters.base import get_app_data_dirs, local_tz
 from tokenlens.models import AgentSourceInfo, UsageEvent
 from tokenlens.pricing import estimate_cost_usd
 from tokenlens.scanner import TokenScanner
@@ -72,6 +74,14 @@ class TokenLensCoreTest(unittest.TestCase):
         # Empty agent selection -> 0 tokens
         ov_none = scanner.build_overview(selected_agents=[], range_type="7d")
         self.assertEqual(ov_none["kpis"]["total_tokens"], 0)
+
+    def test_macos_apple_silicon_paths(self) -> None:
+        with patch("tokenlens.adapters.base.os.name", "posix"), patch(
+            "tokenlens.adapters.base.sys.platform", "darwin"
+        ):
+            dirs = get_app_data_dirs()
+            self.assertEqual(dirs[0], Path.home() / "Library" / "Application Support")
+            self.assertIn(Path.home() / ".local" / "share", dirs)
 
 
 if __name__ == "__main__":

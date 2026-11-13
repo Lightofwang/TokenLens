@@ -26,12 +26,18 @@ def _decompress_zst(fp: Path) -> str:
         return dctx.decompress(raw).decode("utf-8", errors="ignore")
     except Exception:
         pass
-    # Fallback to zstd CLI if present
-    zstd_bin = shutil.which("zstd")
-    if zstd_bin:
-        proc = subprocess.run([zstd_bin, "-dc", str(fp)], capture_output=True, check=False)
-        if proc.returncode == 0:
-            return proc.stdout.decode("utf-8", errors="ignore")
+    # Fallback to zstd CLI if present (including macOS Apple Silicon Homebrew path)
+    zstd_candidates = [
+        shutil.which("zstd"),
+        "/opt/homebrew/bin/zstd",
+        "/usr/local/bin/zstd",
+        "/usr/bin/zstd",
+    ]
+    for zstd_bin in zstd_candidates:
+        if zstd_bin and Path(zstd_bin).exists():
+            proc = subprocess.run([zstd_bin, "-dc", str(fp)], capture_output=True, check=False)
+            if proc.returncode == 0:
+                return proc.stdout.decode("utf-8", errors="ignore")
     raise RuntimeError("No zstd decoder available")
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 import threading
 import time
 from collections import Counter, defaultdict
@@ -466,6 +467,7 @@ class TokenScanner:
                 "last_scan_at": self._last_scan_at.isoformat() if self._last_scan_at else None,
                 "scan_duration_ms": self._scan_duration_ms,
                 "total_indexed_events": len(self._events),
+                "platform": f"{'macOS' if platform.system() == 'Darwin' else platform.system()} {platform.machine()}",
             },
             "kpis": {
                 "total_tokens": tot_tokens,

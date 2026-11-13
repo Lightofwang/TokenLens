@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from ..models import AgentSourceInfo, UsageEvent
 from .base import BaseAdapter, get_app_data_dirs
 
@@ -14,6 +16,12 @@ class WorkBuddyAdapter(BaseAdapter):
         app_dirs = get_app_data_dirs()
         paths_checked: list[str] = []
         paths_found: list[str] = []
+
+        for home_dot in (".workbuddy", ".codebuddy"):
+            hp = Path.home() / home_dot
+            paths_checked.append(str(hp))
+            if hp.exists():
+                paths_found.append(str(hp))
 
         for base in app_dirs:
             for name in ("WorkBuddy", "CodeBuddy", "CodeBuddyExtension"):

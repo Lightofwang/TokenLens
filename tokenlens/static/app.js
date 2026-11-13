@@ -65,6 +65,7 @@ function renderAll(data) {
   const { meta, kpis, sidebar_agents, timeseries, agent_breakdown, model_breakdown, recent_sessions } = data;
 
   $("daemonEndpoint").textContent = window.location.host || "127.0.0.1";
+  $("metaPlatform").textContent = meta.platform || "-";
   $("metaScanMs").textContent = `${meta.scan_duration_ms} ms`;
   $("metaTotalEvents").textContent = fmtNum(meta.total_indexed_events);
   $("metaWindowShort").textContent = meta.start_date

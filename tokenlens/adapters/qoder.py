@@ -49,14 +49,19 @@ class QoderAdapter(BaseAdapter):
         paths_found: list[str] = []
         sessions_seen: set[str] = set()
 
-        # 1. New Qoder CN (Agent SDK ~/.qoder-cn + com.qodercn.app.stable/main.sqlite)
-        qcn_projects = home / ".qoder-cn" / "projects"
-        paths_checked.append(str(qcn_projects))
-        if qcn_projects.exists():
+        # 1. New Qoder / Qoder CN (Agent SDK ~/.qoder-cn, ~/.qoder + main.sqlite)
+        for sdk_dir, app_pkg, label_prefix in (
+            (".qoder-cn", "com.qodercn.app.stable", "QoderCN"),
+            (".qoder", "com.qoder.app.stable", "Qoder"),
+        ):
+            qcn_projects = home / sdk_dir / "projects"
+            paths_checked.append(str(qcn_projects))
+            if not qcn_projects.exists():
+                continue
             paths_found.append(str(qcn_projects))
             stable_titles: dict[str, tuple[str, str]] = {}
             for base in app_dirs:
-                mdb = base / "com.qodercn.app.stable" / "main.sqlite"
+                mdb = base / app_pkg / "main.sqlite"
                 if mdb.exists():
                     paths_found.append(str(mdb))
                     try:
@@ -134,8 +139,8 @@ class QoderAdapter(BaseAdapter):
                     if inp + cr + cw + out <= 0 and credits <= 0:
                         continue
 
-                    model = str(msg.get("model") or obj.get("model") or "qoder-cn")
-                    full_sid = f"QoderCN:{session_id}"
+                    model = str(msg.get("model") or obj.get("model") or label_prefix.lower())
+                    full_sid = f"{label_prefix}:{session_id}"
                     sessions_seen.add(full_sid)
                     events.append(
                         UsageEvent(
@@ -148,7 +153,7 @@ class QoderAdapter(BaseAdapter):
                             cache_read=cr,
                             cache_write=cw,
                             output=out,
-                            title=first_user_title or f"QoderCN {session_id[:8]}",
+                            title=first_user_title or f"{label_prefix} {session_id[:8]}",
                             project_path=s_cwd,
                             is_estimated=is_est,
                             source_file=src_fp,
