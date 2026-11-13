@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import struct
 import tempfile
 import unittest
+import zlib
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from unittest.mock import patch
@@ -370,6 +372,142 @@ class TokenLensCoreTest(unittest.TestCase):
             self.assertEqual(stream_ev.total_tokens, 45355)
             backfill_ev = [e for e in events if e.model == "kimi-k2.6"][0]
             self.assertEqual(backfill_ev.total_tokens, 12500)
+
+    def test_trae_alaudalog_custom_model_proxy_estimation(self) -> None:
+        def enc_hdr(major: int, val: int) -> bytes:
+            if val < 24:
+                return bytes([(major << 5) | val])
+            if val < 256:
+                return bytes([(major << 5) | 24, val])
+            if val < 65536:
+                return struct.pack(">BH", (major << 5) | 25, val)
+            return struct.pack(">BI", (major << 5) | 26, val)
+
+        def encode_cbor(obj) -> bytes:
+            if isinstance(obj, int):
+                return enc_hdr(0, obj)
+            if isinstance(obj, str):
+                b = obj.encode("utf-8")
+                return enc_hdr(3, len(b)) + b
+            if isinstance(obj, list):
+                return enc_hdr(4, len(obj)) + b"".join(encode_cbor(x) for x in obj)
+            if isinstance(obj, dict):
+                return enc_hdr(5, len(obj)) + b"".join(
+                    encode_cbor(k) + encode_cbor(v) for k, v in obj.items()
+                )
+            raise TypeError(type(obj))
+
+        records = [
+            # 1) 连通性测试探针（无 create_agent_task resp_logid，但共用同一个 trace_id）
+            {
+                "name": "custom_model_request",
+                "sid": 10,
+                "psid": 1,
+                "tags": [["request_id", 'Some("probe_req_1")']],
+            },
+            {
+                "span": 10,
+                "time": [2026, 317, 10, 0, 13, 0],
+                "fields": {
+                    "trace_id": "shared_ws_trace",
+                    "message": "[aha_net] send: calling Fetch method=POST, url=http://10.10.1.168:8000/v1/chat/completions, body_len=348",
+                },
+            },
+            # 2) 真实对话请求（含 create_agent_task resp_logid + 子 span Fetch）
+            {
+                "span": 2,
+                "time": [2026, 317, 10, 0, 22, 0],
+                "fields": {
+                    "trace_id": "shared_ws_trace",
+                    "session_id": "6af6dfb685ec8ac0a3df5628",
+                    "provider": 'Some("custom_openai_compatible")',
+                    "config_name": 'Some("qwen3.8-27b")',
+                    "url": "https://api.trae.com.cn/create_agent_task",
+                    "resp_logid": "real_req_1",
+                    "message": "cloud stream response headers",
+                },
+            },
+            {
+                "name": "custom_model_request",
+                "sid": 20,
+                "psid": 1,
+                "tags": [["request_id", 'Some("real_req_1")']],
+            },
+            {
+                "name": "fetch_child",
+                "sid": 21,
+                "psid": 20,
+            },
+            {
+                "span": 21,
+                "time": [2026, 317, 10, 0, 23, 385285000],
+                "fields": {
+                    "trace_id": "shared_ws_trace",
+                    "message": "[aha_net] send: calling Fetch method=POST, url=http://10.10.1.168:8000/v1/chat/completions, body_len=110178",
+                },
+            },
+            {
+                "span": 20,
+                "time": [2026, 317, 10, 0, 31, 0],
+                "fields": {
+                    "trace_id": "shared_ws_trace",
+                    "message": "SSE stream ended normally after 7 messages in 8.45s",
+                },
+            },
+            {
+                "span": 20,
+                "time": [2026, 317, 10, 0, 31, 100000000],
+                "fields": {
+                    "trace_id": "shared_ws_trace",
+                    "duration_ms": "7780",
+                    "message": "[CustomModelProxy] sse.end dispatched",
+                },
+            },
+        ]
+
+        cbor_stream = b"".join(encode_cbor(r) for r in records)
+        comp = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        deflate_payload = comp.compress(cbor_stream) + comp.flush()
+        ver = b"3.4.18"
+        alauda_bytes = (
+            b"AalG"
+            + b"\x00" * 32
+            + b"AALG"
+            + b"\x00" * 12
+            + struct.pack("<I", len(ver))
+            + ver
+            + deflate_payload
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sess_dir = root / "Trae CN" / "logs" / "20261113T175549"
+            mod_dir = sess_dir / "Modular"
+            win_dir = sess_dir / "window1"
+            mod_dir.mkdir(parents=True)
+            win_dir.mkdir(parents=True)
+
+            (mod_dir / "ai_agent-0-2026-11-13.alaudalog").write_bytes(alauda_bytes)
+            (win_dir / "renderer.log").write_text(
+                '2026-11-13 18:00:32 [info] update session {"chat_session_id":"6af6dfb685ec8ac0a3df5628","title":"你好"}\n',
+                encoding="utf-8",
+            )
+
+            events, info = TraeAdapter(
+                app_dirs=[root], marscode_dir=root / ".marscode"
+            ).scan()
+
+            self.assertEqual(info.status, "estimated")
+            self.assertEqual(len(events), 1)
+            ev = events[0]
+            self.assertTrue(ev.is_estimated)
+            self.assertEqual(ev.session_id, "Trae CN:6af6dfb685ec8ac0a3df5628")
+            self.assertEqual(ev.model, "custom_openai_compatible//qwen3.8-27b")
+            self.assertEqual(ev.uncached_input, 27544)
+            self.assertEqual(ev.output, 14)
+            self.assertEqual(ev.total_tokens, 27558)
+            self.assertEqual(ev.duration_ms, 7780)
+            self.assertEqual(ev.title, "你好")
 
 
 if __name__ == "__main__":
