@@ -12,6 +12,7 @@ from typing import Any
 from ..models import AgentSourceInfo, UsageEvent
 from .base import (
     BaseAdapter,
+    estimate_tokens_from_text,
     get_app_data_dirs,
     local_tz,
     open_sqlite_ro,
@@ -19,7 +20,6 @@ from .base import (
     parse_iso_dt,
 )
 
-_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 _LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))")
 _TRACE_ID_RE = re.compile(r'trace_id="([^"]+)"')
 _SESSION_EQ_RE = re.compile(r"session_id=([A-Za-z0-9_-]{8,})")
@@ -57,14 +57,6 @@ def _normalize_model_name(name: str) -> str:
     if name.startswith("customendpoint/"):
         return name[len("customendpoint/"):]
     return name
-
-
-def estimate_tokens_from_text(text: str) -> int:
-    if not text:
-        return 0
-    cjk_count = len(_CJK_RE.findall(text))
-    other_count = max(0, len(text) - cjk_count)
-    return max(1, int(round(cjk_count * 1.5 + other_count * 0.28)))
 
 
 def _decode_cbor(buf: bytes, pos: int = 0) -> tuple[Any, int]:
@@ -487,10 +479,10 @@ class TraeAdapter(BaseAdapter):
                         cur_task["server_replies"] += 1
                 elif "resolving explicit Cloud task completion as terminal" in msg or "chat: runner completed" in msg:
                     status_val = _to_text(fields.get("status"))
-                    if not status_val or ("Err" not in status_val and "Cancel" not in status_val):
+                    if dt is not None:
+                        cur_task["end_dt"] = dt
+                    if not status_val or "Err" not in status_val:
                         cur_task["completed"] = True
-                        if dt is not None:
-                            cur_task["end_dt"] = dt
 
             if isinstance(span_id, int) and span_id in custom_calls:
                 if "SSE stream ended normally after" in msg:

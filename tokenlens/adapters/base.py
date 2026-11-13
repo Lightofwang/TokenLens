@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -11,6 +12,17 @@ from pathlib import Path
 from typing import Iterable
 
 from ..models import AgentSourceInfo, UsageEvent
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
+
+
+def estimate_tokens_from_text(text: str) -> int:
+    """Rough mixed CJK/ASCII token estimator when native usage counts are absent."""
+    if not text:
+        return 0
+    cjk_count = len(_CJK_RE.findall(text))
+    other_count = max(0, len(text) - cjk_count)
+    return max(1, int(round(cjk_count * 1.5 + other_count * 0.28)))
 
 
 def local_tz():
@@ -48,6 +60,9 @@ def open_sqlite_ro(db_path: Path) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True, timeout=3.0)
 
 
+_SNAPSHOT_TMP_DIRS: dict[int, str] = {}
+
+
 def open_sqlite_snapshot(db_path: Path) -> sqlite3.Connection | None:
     """Open SQLite read-only; copy DB + WAL/SHM to a temp dir when locked or WAL-active."""
     try:
@@ -68,7 +83,7 @@ def open_sqlite_snapshot(db_path: Path) -> sqlite3.Connection | None:
             if side.exists():
                 shutil.copy2(side, Path(str(dst) + ext))
         conn = sqlite3.connect(str(dst), timeout=2.0)
-        conn._tl_tmp_dir = tmp_dir  # type: ignore[attr-defined]
+        _SNAPSHOT_TMP_DIRS[id(conn)] = tmp_dir
         return conn
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -78,7 +93,7 @@ def open_sqlite_snapshot(db_path: Path) -> sqlite3.Connection | None:
 def close_sqlite_snapshot(conn: sqlite3.Connection | None) -> None:
     if conn is None:
         return
-    tmp_dir = getattr(conn, "_tl_tmp_dir", None)
+    tmp_dir = _SNAPSHOT_TMP_DIRS.pop(id(conn), None)
     try:
         conn.close()
     finally:

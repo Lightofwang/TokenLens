@@ -11,6 +11,7 @@ from ..models import AgentSourceInfo, UsageEvent
 from .base import (
     BaseAdapter,
     close_sqlite_snapshot,
+    estimate_tokens_from_text,
     get_app_data_dirs,
     local_tz,
     open_sqlite_snapshot,
@@ -57,6 +58,89 @@ def _normalize_model_name(raw_model: str | None, fallback: str = "copilot") -> s
     return m
 
 
+def _flatten_text(node: Any, depth: int = 0) -> str:
+    """Extract readable prompt/response text from nested Copilot JSON payloads."""
+    if depth > 6 or node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    parts: list[str] = []
+    if isinstance(node, list):
+        for item in node:
+            t = _flatten_text(item, depth + 1)
+            if t:
+                parts.append(t)
+    elif isinstance(node, dict):
+        # Skip tool confirmation metadata noise; keep actual content/response/arguments
+        for key in ("text", "value", "response", "content", "arguments"):
+            if key in node:
+                t = _flatten_text(node[key], depth + 1)
+                if t:
+                    parts.append(t)
+        if not parts:
+            for k, v in node.items():
+                if k in ("$mid", "baseUri", "themeIcon", "id", "toolCallId", "kind"):
+                    continue
+                if isinstance(v, (list, dict)):
+                    t = _flatten_text(v, depth + 1)
+                    if t:
+                        parts.append(t)
+    return "\n".join(parts)
+
+
+def _extract_prompt_and_reply_text(req: dict[str, Any]) -> tuple[str, str, str, bool]:
+    res = req.get("result") if isinstance(req.get("result"), dict) else {}
+    meta = res.get("metadata") if isinstance(res.get("metadata"), dict) else {}
+
+    user_raw = ""
+    if isinstance(req.get("message"), dict):
+        user_raw = str(req["message"].get("text") or "")
+
+    rendered = _flatten_text(meta.get("renderedUserMessage"))
+    tool_res = _flatten_text(meta.get("toolCallResults"))
+    prompt_parts = [p for p in (rendered or user_raw, tool_res) if p]
+    prompt_text = "\n".join(prompt_parts)
+
+    rounds = meta.get("toolCallRounds")
+    reply_parts: list[str] = []
+    if isinstance(rounds, list) and rounds:
+        for rd in rounds:
+            if not isinstance(rd, dict):
+                continue
+            rt = str(rd.get("response") or "")
+            if rt:
+                reply_parts.append(rt)
+            tc = rd.get("toolCalls")
+            if isinstance(tc, list):
+                for call in tc:
+                    if isinstance(call, dict) and call.get("arguments"):
+                        reply_parts.append(str(call["arguments"]))
+    if not reply_parts and req.get("response"):
+        resp_txt = _flatten_text(req.get("response"))
+        if resp_txt:
+            reply_parts.append(resp_txt)
+
+    return prompt_text, "\n".join(reply_parts), user_raw, bool(rendered)
+
+
+def _set_nested_path(target: dict[str, Any], keys: list[Any], value: Any, append_list: bool = False) -> None:
+    cur: Any = target
+    for key in keys[:-1]:
+        if not isinstance(key, str) or not isinstance(cur, dict):
+            return
+        nxt = cur.get(key)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[key] = nxt
+        cur = nxt
+    last = keys[-1]
+    if isinstance(last, str) and isinstance(cur, dict):
+        if append_list and isinstance(value, list) and isinstance(cur.get(last), list):
+            cur[last].extend(value)
+        else:
+            cur[last] = value
+
+
 def _extract_request_event(
     agent_id: str,
     agent_name: str,
@@ -66,6 +150,7 @@ def _extract_request_event(
     fallback_model: str,
     session_title: str,
     source_file: Path,
+    rolling_ctx: list[int] | None = None,
 ) -> UsageEvent | None:
     res = req.get("result") if isinstance(req.get("result"), dict) else {}
     meta = res.get("metadata") if isinstance(res.get("metadata"), dict) else {}
@@ -80,14 +165,54 @@ def _extract_request_event(
     )
     cr = int(req.get("cacheReadTokens") or meta.get("cacheReadTokens") or meta.get("cachedInputTokens") or 0)
     cw = int(req.get("cacheWriteTokens") or meta.get("cacheWriteTokens") or 0)
-    if pt + ct + cr + cw <= 0:
-        return None
+
+    is_estimated = False
+    if pt > 0 or cr > 0 or cw > 0:
+        if rolling_ctx is not None:
+            rolling_ctx[0] = max(rolling_ctx[0], pt + cr + ct)
+    elif ct > 0:
+        # Some Copilot Chat .jsonl logs emit completionTokens without promptTokens
+        prompt_text, _, user_raw, has_rendered = _extract_prompt_and_reply_text(req)
+        base_in = estimate_tokens_from_text(prompt_text)
+        prev_ctx = rolling_ctx[0] if rolling_ctx is not None else 0
+        if has_rendered:
+            pt = max(base_in + 800, prev_ctx + estimate_tokens_from_text(user_raw) + 400)
+        else:
+            pt = max(prev_ctx + base_in + 1200, 1200)
+        if rolling_ctx is not None:
+            rolling_ctx[0] = pt + ct
+        is_estimated = True
+    else:
+        # Chat requests without native token counters: estimate from rendered prompt & reply text
+        prompt_text, reply_text, user_raw, has_rendered = _extract_prompt_and_reply_text(req)
+        out_est = estimate_tokens_from_text(reply_text)
+        if out_est <= 0:
+            return None
+        if req.get("isCanceled") and out_est < 10:
+            return None
+        base_in = estimate_tokens_from_text(prompt_text)
+        prev_ctx = rolling_ctx[0] if rolling_ctx is not None else 0
+        if has_rendered:
+            pt = max(base_in + 800, prev_ctx + estimate_tokens_from_text(user_raw) + 400)
+        else:
+            pt = max(prev_ctx + base_in + 1200, 1200)
+        ct = out_est
+        if rolling_ctx is not None:
+            rolling_ctx[0] = pt + ct
+        is_estimated = True
 
     dt = parse_epoch_dt(req.get("timestamp")) or fallback_dt
     if not dt:
         return None
 
-    model = _normalize_model_name(req.get("modelId") or meta.get("modelId"), fallback=fallback_model)
+    sel_m = req.get("selectedModel") if isinstance(req.get("selectedModel"), dict) else {}
+    model = _normalize_model_name(
+        req.get("modelId")
+        or meta.get("modelId")
+        or res.get("modelId")
+        or sel_m.get("identifier"),
+        fallback=fallback_model,
+    )
     msg_txt = ""
     if isinstance(req.get("message"), dict):
         msg_txt = str(req["message"].get("text") or "").strip().replace("\n", " ")[:120]
@@ -106,6 +231,7 @@ def _extract_request_event(
         cache_write=cw,
         output=ct,
         title=session_title or msg_txt or f"VSCode {session_id[:8]}",
+        is_estimated=is_estimated,
         source_file=str(source_file),
         duration_ms=elapsed_ms,
         credits=credits,
@@ -350,13 +476,13 @@ class VSCodeAdapter(BaseAdapter):
 
         return found_paths
 
-    def _scan_chat_sessions(
+    def _scan_chat_session_files(
         self,
-        ws_root: Path,
+        session_files: list[Path],
         events: list[UsageEvent],
         sessions_seen: set[str],
     ) -> None:
-        for fp in ws_root.glob("*/chatSessions/*"):
+        for fp in session_files:
             if not fp.is_file():
                 continue
             session_id = fp.stem
@@ -367,6 +493,7 @@ class VSCodeAdapter(BaseAdapter):
                     continue
                 cdate = parse_epoch_dt(obj.get("creationDate"))
                 s_title = str(obj.get("customTitle") or "").strip()[:120]
+                rolling_ctx = [0]
                 for req in obj.get("requests") or []:
                     if not isinstance(req, dict):
                         continue
@@ -379,6 +506,7 @@ class VSCodeAdapter(BaseAdapter):
                         "copilot",
                         s_title,
                         fp,
+                        rolling_ctx=rolling_ctx,
                     )
                     if ev is not None:
                         sessions_seen.add(session_id)
@@ -429,19 +557,20 @@ class VSCodeAdapter(BaseAdapter):
                                     else:
                                         requests_list.extend(items)
                             elif len(k) >= 3 and k[0] == "requests" and isinstance(k[1], int):
-                                idx, field = k[1], k[2]
+                                idx = k[1]
                                 while len(requests_list) <= idx:
                                     requests_list.append({})
-                                if len(k) == 3:
-                                    requests_list[idx][field] = v
-                                elif field == "result" and len(k) >= 4 and isinstance(k[3], str):
-                                    res = requests_list[idx].setdefault("result", {})
-                                    if isinstance(res, dict):
-                                        res[k[3]] = v
+                                _set_nested_path(
+                                    requests_list[idx],
+                                    k[2:],
+                                    v,
+                                    append_list=(kind == 2 and k[2:] == ["response"]),
+                                )
                 except Exception:
                     continue
 
                 fallback_dt = cdate or datetime.fromtimestamp(fp.stat().st_mtime, tz=local_tz())
+                rolling_ctx = [0]
                 for req in requests_list:
                     ev = _extract_request_event(
                         self.agent_id,
@@ -452,10 +581,192 @@ class VSCodeAdapter(BaseAdapter):
                         default_model,
                         s_title,
                         fp,
+                        rolling_ctx=rolling_ctx,
                     )
                     if ev is not None:
                         sessions_seen.add(session_id)
                         events.append(ev)
+
+    def _scan_copilot_session_store(
+        self,
+        store_db: Path,
+        events: list[UsageEvent],
+        sessions_seen: set[str],
+    ) -> None:
+        """Fallback estimation from github.copilot-chat/session-store.db for sessions absent elsewhere."""
+        conn = open_sqlite_snapshot(store_db)
+        if conn is None:
+            return
+        try:
+            tables = {
+                r[0]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            if "sessions" not in tables or "turns" not in tables:
+                return
+            sess_meta: dict[str, tuple[str, str, datetime | None]] = {}
+            for sid, cwd, summary, created_at in conn.execute(
+                "SELECT id, cwd, summary, created_at FROM sessions"
+            ).fetchall():
+                sess_meta[str(sid)] = (
+                    str(cwd or ""),
+                    str(summary or "").strip().replace("\n", " ")[:120],
+                    parse_iso_dt(created_at),
+                )
+
+            rows = conn.execute(
+                "SELECT session_id, user_message, assistant_response, timestamp "
+                "FROM turns ORDER BY session_id, turn_index"
+            ).fetchall()
+            rolling_by_sid: dict[str, int] = {}
+            for raw_sid, user_msg, asst_resp, ts in rows:
+                sid = str(raw_sid or "")
+                if not sid or sid in sessions_seen:
+                    continue
+                asst_txt = str(asst_resp or "").strip()
+                if not asst_txt:
+                    continue
+                user_txt = str(user_msg or "")
+                cwd, summary, created_dt = sess_meta.get(sid, ("", "", None))
+                dt = parse_iso_dt(ts) or created_dt
+                if not dt:
+                    continue
+                in_turn = estimate_tokens_from_text(user_txt)
+                out_turn = estimate_tokens_from_text(asst_txt)
+                if out_turn <= 0:
+                    continue
+                prev = rolling_by_sid.get(sid, 0)
+                prompt_est = max(prev + in_turn + 1200, 1200)
+                rolling_by_sid[sid] = prompt_est + out_turn
+                sessions_seen.add(sid)
+                events.append(
+                    UsageEvent(
+                        agent_id=self.agent_id,
+                        agent_name=self.agent_name,
+                        session_id=sid,
+                        timestamp=dt,
+                        model="copilot",
+                        uncached_input=prompt_est,
+                        output=out_turn,
+                        title=summary or user_txt.strip().replace("\n", " ")[:120] or f"VSCode {sid[:8]}",
+                        project_path=cwd,
+                        is_estimated=True,
+                        source_file=str(store_db),
+                    )
+                )
+        except Exception:
+            pass
+        finally:
+            close_sqlite_snapshot(conn)
+
+    def _scan_extension_tasks(
+        self,
+        gs_dir: Path,
+        events: list[UsageEvent],
+        sessions_seen: set[str],
+    ) -> list[str]:
+        """Scan Cline / Roo Code / Kilo Code task logs under VS Code globalStorage."""
+        ext_map = (
+            ("saoudrizwan.claude-dev", "cline"),
+            ("rooveterinaryinc.roo-cline", "roo-code"),
+            ("kilocode.kilo-code", "kilo-code"),
+        )
+        found: list[str] = []
+        for ext_id, model_tag in ext_map:
+            tasks_dir = gs_dir / ext_id / "tasks"
+            if not tasks_dir.exists():
+                continue
+            found.append(str(tasks_dir))
+            for task_dir in tasks_dir.iterdir():
+                if not task_dir.is_dir():
+                    continue
+                sid = f"{model_tag}:{task_dir.name}"
+                ui_file = task_dir / "ui_messages.json"
+                api_file = task_dir / "api_conversation_history.json"
+                task_added = 0
+                s_title = ""
+                if ui_file.is_file():
+                    try:
+                        ui_msgs = json.loads(ui_file.read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
+                        ui_msgs = []
+                    if isinstance(ui_msgs, list):
+                        for item in ui_msgs:
+                            if not isinstance(item, dict):
+                                continue
+                            if not s_title and item.get("say") == "task" and item.get("text"):
+                                s_title = str(item["text"]).strip().replace("\n", " ")[:120]
+                            if item.get("say") != "api_req_started":
+                                continue
+                            try:
+                                payload = json.loads(str(item.get("text") or "{}"))
+                            except Exception:
+                                continue
+                            if not isinstance(payload, dict):
+                                continue
+                            in_tok = int(payload.get("tokensIn") or 0)
+                            out_tok = int(payload.get("tokensOut") or 0)
+                            cw = int(payload.get("cacheWrites") or 0)
+                            cr = int(payload.get("cacheReads") or 0)
+                            if in_tok + out_tok + cw + cr <= 0:
+                                continue
+                            dt = parse_epoch_dt(item.get("ts")) or datetime.fromtimestamp(
+                                ui_file.stat().st_mtime, tz=local_tz()
+                            )
+                            sessions_seen.add(sid)
+                            events.append(
+                                UsageEvent(
+                                    agent_id=self.agent_id,
+                                    agent_name=self.agent_name,
+                                    session_id=sid,
+                                    timestamp=dt,
+                                    model=_normalize_model_name(payload.get("model"), fallback=model_tag),
+                                    uncached_input=in_tok,
+                                    cache_read=cr,
+                                    cache_write=cw,
+                                    output=out_tok,
+                                    title=s_title or f"{model_tag} {task_dir.name[:8]}",
+                                    source_file=str(ui_file),
+                                )
+                            )
+                            task_added += 1
+                if task_added == 0 and api_file.is_file():
+                    try:
+                        hist = json.loads(api_file.read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
+                        hist = []
+                    if isinstance(hist, list) and hist:
+                        dt = datetime.fromtimestamp(api_file.stat().st_mtime, tz=local_tz())
+                        rolling = 0
+                        for msg in hist:
+                            if not isinstance(msg, dict):
+                                continue
+                            role = msg.get("role")
+                            txt = _flatten_text(msg.get("content"))
+                            tok = estimate_tokens_from_text(txt)
+                            if role == "user":
+                                if not s_title and txt.strip():
+                                    s_title = txt.strip().replace("\n", " ")[:120]
+                                rolling += tok + 800
+                            elif role == "assistant" and tok > 0:
+                                prompt_est = max(rolling, 1200)
+                                rolling += tok
+                                sessions_seen.add(sid)
+                                events.append(
+                                    UsageEvent(
+                                        agent_id=self.agent_id,
+                                        agent_name=self.agent_name,
+                                        session_id=sid,
+                                        timestamp=dt,
+                                        model=model_tag,
+                                        uncached_input=prompt_est,
+                                        output=tok,
+                                        title=s_title or f"{model_tag} {task_dir.name[:8]}",
+                                        is_estimated=True,
+                                        source_file=str(api_file),
+                                    )
+                                )
+        return found
 
     def scan(self) -> tuple[list[UsageEvent], AgentSourceInfo]:
         app_dirs = self._app_dirs if self._app_dirs is not None else get_app_data_dirs()
@@ -479,21 +790,37 @@ class VSCodeAdapter(BaseAdapter):
             )
 
         code_dirs_found = False
+        session_store_dbs: list[Path] = []
         for base in app_dirs:
             for edition in ("Code", "Code - Insiders"):
                 code_dir = base / edition
-                ws = code_dir / "User" / "workspaceStorage"
+                user_dir = code_dir / "User"
+                ws = user_dir / "workspaceStorage"
+                gs = user_dir / "globalStorage"
                 paths_checked.append(str(ws))
                 if code_dir.exists():
                     code_dirs_found = True
                 if ws.exists():
                     paths_found.append(str(ws))
-                    self._scan_chat_sessions(ws, events, sessions_seen)
+                    self._scan_chat_session_files(list(ws.glob("*/chatSessions/*")), events, sessions_seen)
+                empty_cs = gs / "emptyWindowChatSessions"
+                if empty_cs.exists():
+                    paths_found.append(str(empty_cs))
+                    self._scan_chat_session_files(list(empty_cs.glob("*")), events, sessions_seen)
                 if code_dir.exists():
                     found_agent_paths = self._scan_agent_session_data(
                         code_dir, events, sessions_seen, seen_api_calls, seen_signatures
                     )
                     paths_found.extend(found_agent_paths)
+                if gs.exists():
+                    paths_found.extend(self._scan_extension_tasks(gs, events, sessions_seen))
+                    store_db = gs / "github.copilot-chat" / "session-store.db"
+                    if store_db.is_file():
+                        paths_found.append(str(store_db))
+                        session_store_dbs.append(store_db)
+
+        for store_db in session_store_dbs:
+            self._scan_copilot_session_store(store_db, events, sessions_seen)
 
         if not paths_found and not code_dirs_found:
             return events, AgentSourceInfo(
@@ -506,8 +833,21 @@ class VSCodeAdapter(BaseAdapter):
                 paths_checked=paths_checked,
             )
 
-        status = "exact" if events else "unavailable"
-        label = "精确记录 (ChatSessions + AgentHost)" if events else "未检测到含 Token 的会话"
+        exact_cnt = sum(1 for e in events if not e.is_estimated)
+        est_cnt = len(events) - exact_cnt
+        if exact_cnt and est_cnt:
+            status = "estimated"
+            label = "精确记录 + 文本估算"
+        elif exact_cnt:
+            status = "exact"
+            label = "精确记录 (ChatSessions + AgentHost)"
+        elif est_cnt:
+            status = "estimated"
+            label = "对话文本估算 (无原生 Token 字段)"
+        else:
+            status = "unavailable"
+            label = "未检测到含 Token 或文本的会话"
+
         return events, AgentSourceInfo(
             agent_id=self.agent_id,
             name=self.agent_name,
@@ -521,7 +861,8 @@ class VSCodeAdapter(BaseAdapter):
             sessions_count=len(sessions_seen),
             total_tokens=sum(e.total_tokens for e in events),
             notes=(
-                "读取 ~/.copilot/session-state、VS Code agentSessionData/*/session.db "
-                "与 workspaceStorage/*/chatSessions，支持 Copilot 与自定义 BYOK 模型。"
+                "读取 ~/.copilot/session-state、agentSessionData/*/session.db、"
+                "chatSessions / emptyWindowChatSessions（含无 Token 字段时的文本估算）、"
+                "github.copilot-chat/session-store.db 与 Cline/Roo/Kilo 任务。"
             ),
         )

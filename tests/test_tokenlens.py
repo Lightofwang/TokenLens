@@ -574,6 +574,92 @@ class TokenLensCoreTest(unittest.TestCase):
             self.assertEqual(ev_builtin.duration_ms, 6000)
             self.assertEqual(ev_builtin.title, "内置模型测试")
 
+    def test_vscode_text_estimation_wal_session_store_and_dedup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            code_user = root / "Code" / "User"
+            ws_chat = code_user / "workspaceStorage" / "ws_plain" / "chatSessions"
+            empty_chat = code_user / "globalStorage" / "emptyWindowChatSessions"
+            copilot_gs = code_user / "globalStorage" / "github.copilot-chat"
+            ws_chat.mkdir(parents=True)
+            empty_chat.mkdir(parents=True)
+            copilot_gs.mkdir(parents=True)
+
+            # 1) Plain Copilot Chat .json without native promptTokens/completionTokens
+            (ws_chat / "no-tok-1.json").write_text(
+                json.dumps(
+                    {
+                        "creationDate": 1791531583322,
+                        "customTitle": "Plain Copilot Chat",
+                        "requests": [
+                            {
+                                "timestamp": 1791531585000,
+                                "isCanceled": False,
+                                "message": {"text": "帮我检查一下登录鉴权逻辑"},
+                                "result": {
+                                    "metadata": {
+                                        "renderedUserMessage": [{"type": 1, "text": "<userPrompt>帮我检查一下登录鉴权逻辑</userPrompt>"}],
+                                        "toolCallRounds": [
+                                            {"response": "我来帮你检查 src/auth.py 的鉴权流程并确认 token 校验是否正确。", "toolCalls": []}
+                                        ],
+                                    }
+                                },
+                            },
+                            {
+                                "timestamp": 1791531595000,
+                                "isCanceled": True,
+                                "message": {"text": "空取消请求"},
+                                "response": [],
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # 2) emptyWindowChatSessions .jsonl with completionTokens only (missing promptTokens)
+            empty_lines = [
+                {"kind": 0, "v": {"creationDate": 1791532000000, "customTitle": "Empty window patch"}},
+                {"kind": 2, "k": ["requests"], "v": [{"requestId": "r0", "timestamp": 1791532010000, "message": {"text": "总结变更"}}]},
+                {"kind": 1, "k": ["requests", 0, "modelId"], "v": "copilot/claude-haiku-4.5"},
+                {"kind": 1, "k": ["requests", 0, "completionTokens"], "v": 120},
+                {"kind": 1, "k": ["requests", 0, "result", "metadata", "renderedUserMessage"], "v": [{"type": 1, "text": "git diff summary prompt content here"}]},
+            ]
+            (empty_chat / "empty-1.jsonl").write_text(
+                "\n".join(json.dumps(x) for x in empty_lines) + "\n",
+                encoding="utf-8",
+            )
+
+            # 3) WAL-active session-store.db containing both duplicate (no-tok-1) and store-only-1
+            store_db = copilot_gs / "session-store.db"
+            conn = sqlite3.connect(str(store_db))
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, summary TEXT, created_at TEXT)")
+            conn.execute("CREATE TABLE turns (id INTEGER PRIMARY KEY, session_id TEXT, turn_index INTEGER, user_message TEXT, assistant_response TEXT, timestamp TEXT)")
+            conn.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", ("no-tok-1", "/repo", "Plain Copilot Chat", "2026-11-12T10:00:00Z"))
+            conn.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)", ("store-only-1", "/repo", "Store Fallback Session", "2026-11-12T11:00:00Z"))
+            conn.execute("INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp) VALUES (?, ?, ?, ?, ?)", ("no-tok-1", 0, "u", "should be deduped", "2026-11-12T10:00:01Z"))
+            conn.execute("INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp) VALUES (?, ?, ?, ?, ?)", ("store-only-1", 0, "如何优化数据库索引", "可以对频繁查询的 session_id 列建立复合索引。", "2026-11-12T11:00:02Z"))
+            conn.commit()
+            # Keep connection open briefly while scanning so -wal exists and is non-empty!
+            try:
+                events, info = VSCodeAdapter(app_dirs=[root], copilot_dir=root / ".no_copilot").scan()
+            finally:
+                conn.close()
+
+            self.assertEqual(info.status, "estimated")
+            self.assertEqual(len(events), 3)
+            self.assertEqual(info.sessions_count, 3)
+            by_sid = {e.session_id: e for e in events}
+            self.assertIn("no-tok-1", by_sid)
+            self.assertGreater(by_sid["no-tok-1"].uncached_input, 800)
+            self.assertGreater(by_sid["no-tok-1"].output, 10)
+            self.assertEqual(by_sid["empty-1"].model, "copilot/claude-haiku-4.5")
+            self.assertEqual(by_sid["empty-1"].output, 120)
+            self.assertGreater(by_sid["empty-1"].uncached_input, 800)
+            self.assertIn("store-only-1", by_sid)
+            self.assertEqual(by_sid["store-only-1"].title, "Store Fallback Session")
+
 
 if __name__ == "__main__":
     unittest.main()
