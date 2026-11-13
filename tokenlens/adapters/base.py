@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import sys
+import tempfile
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +46,44 @@ def parse_epoch_dt(value: int | float | str | None) -> datetime | None:
 def open_sqlite_ro(db_path: Path) -> sqlite3.Connection:
     uri = f"file:{db_path.as_posix()}?mode=ro"
     return sqlite3.connect(uri, uri=True, timeout=3.0)
+
+
+def open_sqlite_snapshot(db_path: Path) -> sqlite3.Connection | None:
+    """Open SQLite read-only; copy DB + WAL/SHM to a temp dir when locked or WAL-active."""
+    try:
+        wal = Path(str(db_path) + "-wal")
+        if not wal.exists() or wal.stat().st_size == 0:
+            conn = open_sqlite_ro(db_path)
+            conn.execute("SELECT 1").fetchone()
+            return conn
+    except Exception:
+        pass
+
+    tmp_dir = tempfile.mkdtemp(prefix="tl_sqlite_")
+    try:
+        dst = Path(tmp_dir) / db_path.name
+        shutil.copy2(db_path, dst)
+        for ext in ("-wal", "-shm"):
+            side = Path(str(db_path) + ext)
+            if side.exists():
+                shutil.copy2(side, Path(str(dst) + ext))
+        conn = sqlite3.connect(str(dst), timeout=2.0)
+        conn._tl_tmp_dir = tmp_dir  # type: ignore[attr-defined]
+        return conn
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+
+def close_sqlite_snapshot(conn: sqlite3.Connection | None) -> None:
+    if conn is None:
+        return
+    tmp_dir = getattr(conn, "_tl_tmp_dir", None)
+    try:
+        conn.close()
+    finally:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def get_app_data_dirs() -> list[Path]:

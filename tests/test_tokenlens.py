@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 from tokenlens.adapters.base import get_app_data_dirs, local_tz
+from tokenlens.adapters.claude_code import ClaudeCodeAdapter
 from tokenlens.adapters.trae import TraeAdapter
 from tokenlens.adapters.vscode import VSCodeAdapter
 from tokenlens.models import AgentSourceInfo, UsageEvent
@@ -240,6 +241,135 @@ class TokenLensCoreTest(unittest.TestCase):
             self.assertEqual(events[0].cache_read, 500)
             self.assertEqual(events[0].output, 120)
             self.assertEqual(events[1].model, "trae-utility")
+
+    def test_claude_code_stream_dedup_and_ccswitch_rollup_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proj_dir = root / "projects" / "demo-proj"
+            sub_dir = proj_dir / "sess-main" / "subagents"
+            sub_dir.mkdir(parents=True)
+
+            main_lines = [
+                {
+                    "type": "user",
+                    "sessionId": "sess-main",
+                    "timestamp": "2026-07-16T08:00:00Z",
+                    "message": {"role": "user", "content": "修复统计逻辑"},
+                },
+                # 同一 requestId 先出现中间流式块（out=0），随后出现完整块（out=813）
+                {
+                    "type": "assistant",
+                    "sessionId": "sess-main",
+                    "requestId": "req_stream_1",
+                    "timestamp": "2026-07-16T08:00:02Z",
+                    "message": {
+                        "id": "msg_1",
+                        "model": "gpt-5.6-sol",
+                        "usage": {
+                            "input_tokens": 5000,
+                            "cache_read_input_tokens": 844,
+                            "output_tokens": 0,
+                        },
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": "sess-main",
+                    "requestId": "req_stream_1",
+                    "timestamp": "2026-07-16T08:00:05Z",
+                    "message": {
+                        "id": "msg_1",
+                        "model": "gpt-5.6-sol",
+                        "usage": {
+                            "input_tokens": 40000,
+                            "cache_read_input_tokens": 4392,
+                            "cache_creation_input_tokens": 0,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": 100,
+                                "ephemeral_1h_input_tokens": 50,
+                            },
+                            "output_tokens": 813,
+                        },
+                    },
+                },
+            ]
+            (proj_dir / "sess-main.jsonl").write_text(
+                "\n".join(json.dumps(x) for x in main_lines) + "\n",
+                encoding="utf-8",
+            )
+
+            sub_line = {
+                "type": "assistant",
+                "sessionId": "sess-main",
+                "requestId": "req_sub_1",
+                "timestamp": "2026-07-16T08:01:00Z",
+                "message": {
+                    "id": "msg_sub_1",
+                    "model": "gpt-5.6-sol",
+                    "usage": {
+                        "input_tokens": 100,
+                        "cache_read_input_tokens": 200,
+                        "output_tokens": 50,
+                    },
+                },
+            }
+            (sub_dir / "agent-a1.jsonl").write_text(json.dumps(sub_line) + "\n", encoding="utf-8")
+
+            db_path = root / "cc-switch.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE usage_daily_rollups (
+                    date TEXT,
+                    app_type TEXT,
+                    provider_id TEXT,
+                    model TEXT,
+                    request_model TEXT,
+                    pricing_model TEXT,
+                    request_count INTEGER,
+                    success_count INTEGER,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_creation_tokens INTEGER,
+                    total_cost_usd TEXT,
+                    avg_latency_ms INTEGER,
+                    input_token_semantics TEXT
+                )
+                """
+            )
+            # 2026-07-16 已存在于本地 JSONL，不应重复统计
+            conn.execute(
+                "INSERT INTO usage_daily_rollups VALUES (?, 'claude', 'p1', 'gpt-5.6-sol', 'gpt-5.6-sol', 'gpt-5.6-sol', 2, 2, 40100, 863, 4592, 150, '0.1', 1000, 'raw')"
+                , ("2026-07-16",)
+            )
+            # 2026-05-10 本地 JSONL 已被清理，应从 CC-Switch 回填
+            conn.execute(
+                "INSERT INTO usage_daily_rollups VALUES (?, 'claude', 'p1', 'kimi-k2.6', 'kimi-k2.6', 'kimi-k2.6', 5, 5, 10000, 500, 2000, 0, '0.02', 500, 'raw')"
+                , ("2026-05-10",)
+            )
+            # 非 claude app_type 不应计入 ClaudeCodeAdapter
+            conn.execute(
+                "INSERT INTO usage_daily_rollups VALUES (?, 'codex', 'p2', 'gpt-5', 'gpt-5', 'gpt-5', 3, 3, 99999, 999, 0, 0, '0.5', 500, 'raw')"
+                , ("2026-05-11",)
+            )
+            conn.commit()
+            conn.close()
+
+            events, info = ClaudeCodeAdapter(
+                projects_dirs=[root / "projects"], cc_switch_db=db_path
+            ).scan()
+            self.assertEqual(info.status, "exact")
+            self.assertEqual(len(events), 3)
+            # 主会话 JSONL + subagent 均归属 sess-main，外加 2026-05-10 的 rollup 会话
+            self.assertEqual(info.sessions_count, 2)
+            stream_ev = [e for e in events if e.output == 813][0]
+            self.assertEqual(stream_ev.uncached_input, 40000)
+            self.assertEqual(stream_ev.cache_read, 4392)
+            self.assertEqual(stream_ev.cache_write, 150)
+            self.assertEqual(stream_ev.total_tokens, 45355)
+            backfill_ev = [e for e in events if e.model == "kimi-k2.6"][0]
+            self.assertEqual(backfill_ev.total_tokens, 12500)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import json
-import shutil
 import sqlite3
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 from ..models import AgentSourceInfo, UsageEvent
-from .base import BaseAdapter, get_app_data_dirs, local_tz, parse_epoch_dt, parse_iso_dt
+from .base import (
+    BaseAdapter,
+    close_sqlite_snapshot,
+    get_app_data_dirs,
+    local_tz,
+    open_sqlite_snapshot,
+    parse_epoch_dt,
+    parse_iso_dt,
+)
 
 
 def _decode_file_uri(uri_or_path: str | None) -> str:
@@ -40,46 +46,6 @@ def _parse_workspace_yaml(yaml_path: Path) -> dict[str, str]:
     except Exception:
         pass
     return info
-
-
-def _open_sqlite_snapshot(db_path: Path) -> sqlite3.Connection | None:
-    """Open SQLite DB read-only; copy DB + WAL/SHM to a temp dir when locked or WAL-active."""
-    try:
-        wal = Path(str(db_path) + "-wal")
-        if not wal.exists() or wal.stat().st_size == 0:
-            uri = f"file:{db_path.as_posix()}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, timeout=2.0)
-            conn.execute("SELECT 1").fetchone()
-            return conn
-    except Exception:
-        pass
-
-    tmp_dir = tempfile.mkdtemp(prefix="tl_vscode_")
-    try:
-        dst = Path(tmp_dir) / db_path.name
-        shutil.copy2(db_path, dst)
-        for ext in ("-wal", "-shm"):
-            side = Path(str(db_path) + ext)
-            if side.exists():
-                shutil.copy2(side, Path(str(dst) + ext))
-        conn = sqlite3.connect(str(dst), timeout=2.0)
-        # Attach cleanup path marker on connection via temp dir tracking at caller
-        conn._tl_tmp_dir = tmp_dir  # type: ignore[attr-defined]
-        return conn
-    except Exception:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return None
-
-
-def _close_sqlite_snapshot(conn: sqlite3.Connection | None) -> None:
-    if conn is None:
-        return
-    tmp_dir = getattr(conn, "_tl_tmp_dir", None)
-    try:
-        conn.close()
-    finally:
-        if tmp_dir:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _normalize_model_name(raw_model: str | None, fallback: str = "copilot") -> str:
@@ -274,7 +240,7 @@ class VSCodeAdapter(BaseAdapter):
         host_db = code_dir / "User" / "globalStorage" / "agent-host.db"
         if host_db.is_file():
             found_paths.append(str(host_db))
-            conn = _open_sqlite_snapshot(host_db)
+            conn = open_sqlite_snapshot(host_db)
             if conn is not None:
                 try:
                     for uri, start_ms, mod_ms in conn.execute(
@@ -285,13 +251,13 @@ class VSCodeAdapter(BaseAdapter):
                 except Exception:
                     pass
                 finally:
-                    _close_sqlite_snapshot(conn)
+                    close_sqlite_snapshot(conn)
 
         for sdb in session_root.glob("*/session.db"):
             if not sdb.is_file():
                 continue
             sid = sdb.parent.name
-            conn = _open_sqlite_snapshot(sdb)
+            conn = open_sqlite_snapshot(sdb)
             if conn is None:
                 continue
             try:
@@ -380,7 +346,7 @@ class VSCodeAdapter(BaseAdapter):
             except Exception:
                 continue
             finally:
-                _close_sqlite_snapshot(conn)
+                close_sqlite_snapshot(conn)
 
         return found_paths
 
