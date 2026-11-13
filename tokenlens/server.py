@@ -54,14 +54,26 @@ class TokenLensHandler(BaseHTTPRequestHandler):
         if not path.exists() or not path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
             return
+        suffix_mime = {
+            ".js": "application/javascript",
+            ".css": "text/css",
+            ".svg": "image/svg+xml",
+            ".png": "image/png",
+            ".ico": "image/x-icon",
+            ".webmanifest": "application/manifest+json",
+        }
         mime, _ = mimetypes.guess_type(str(path))
-        if path.suffix == ".js":
-            mime = "application/javascript"
-        elif path.suffix == ".css":
-            mime = "text/css"
+        mime = suffix_mime.get(path.suffix.lower(), mime or "application/octet-stream")
+        is_text = mime.startswith("text/") or mime in {
+            "application/javascript",
+            "application/json",
+            "application/manifest+json",
+            "image/svg+xml",
+        }
+        content_type = f"{mime}; charset=utf-8" if is_text else mime
         data = path.read_bytes()
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", f"{mime or 'application/octet-stream'}; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
