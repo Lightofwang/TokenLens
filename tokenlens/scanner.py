@@ -164,6 +164,8 @@ class TokenScanner:
         tot_out = 0
         tot_cost_usd = 0.0
         tot_savings_usd = 0.0
+        tot_credits = 0.0
+        tot_orig_credits = 0.0
         sessions_set: set[tuple[str, str]] = set()
 
         agent_agg: dict[str, dict[str, Any]] = {}
@@ -183,6 +185,8 @@ class TokenScanner:
             tot_out += e.output
             tot_cost_usd += cost
             tot_savings_usd += save
+            tot_credits += e.credits
+            tot_orig_credits += e.original_credits
             skey = (e.agent_id, e.session_id)
             sessions_set.add(skey)
 
@@ -204,6 +208,7 @@ class TokenScanner:
                     "sessions_set": set(),
                     "models": Counter(),
                     "cost_usd": 0.0,
+                    "credits": 0.0,
                     "has_estimated": False,
                 }
                 agent_agg[e.agent_id] = a
@@ -216,6 +221,7 @@ class TokenScanner:
             a["sessions_set"].add(e.session_id)
             a["models"][e.model] += e.total_tokens
             a["cost_usd"] += cost
+            a["credits"] += e.credits
             if e.is_estimated:
                 a["has_estimated"] = True
 
@@ -262,6 +268,7 @@ class TokenScanner:
                     "cost_usd": 0.0,
                     "first_ts": e.timestamp,
                     "last_ts": e.timestamp,
+                    "credits": 0.0,
                     "is_estimated": e.is_estimated,
                 }
                 session_agg[skey] = sa
@@ -272,6 +279,7 @@ class TokenScanner:
             sa["output"] += e.output
             sa["calls"] += 1
             sa["cost_usd"] += cost
+            sa["credits"] += e.credits
             sa["models"][e.model] += e.total_tokens
             if e.timestamp > sa["last_ts"]:
                 sa["last_ts"] = e.timestamp
@@ -374,6 +382,7 @@ class TokenScanner:
                     "top_model": top_m,
                     "share_pct": round(share, 2),
                     "cost_usd": round(a["cost_usd"], 4),
+                    "credits": round(a["credits"], 2),
                     "has_estimated": a["has_estimated"],
                 }
             )
@@ -419,6 +428,7 @@ class TokenScanner:
                     "calls": s["calls"],
                     "cache_hit_pct": round(hit_pct, 1),
                     "cost_usd": round(s["cost_usd"], 4),
+                    "credits": round(s["credits"], 2),
                     "last_ts": s["last_ts"].isoformat(),
                     "last_ts_display": s["last_ts"].strftime("%Y-%m-%d %H:%M:%S"),
                     "is_estimated": s["is_estimated"],
@@ -473,6 +483,8 @@ class TokenScanner:
                 "calls_count": len(filtered),
                 "sessions_count": len(sessions_set),
                 "avg_tokens_per_session": avg_per_session,
+                "total_credits": round(tot_credits, 2),
+                "total_original_credits": round(tot_orig_credits, 2),
             },
             "sidebar_agents": sidebar_agents,
             "timeseries": {
@@ -559,6 +571,7 @@ class TokenScanner:
                 "cache_write": e.cache_write,
                 "output": e.output,
                 "total_tokens": e.total_tokens,
+                "credits": round(e.credits, 4),
                 "title": e.title,
                 "project_path": e.project_path,
                 "is_estimated": e.is_estimated,

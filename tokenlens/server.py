@@ -121,7 +121,7 @@ class TokenLensHandler(BaseHTTPRequestHandler):
                 fieldnames = [
                     "timestamp", "agent_id", "agent_name", "session_id", "model",
                     "uncached_input", "cache_read", "cache_write", "output",
-                    "total_tokens", "is_estimated", "title", "project_path",
+                    "total_tokens", "credits", "is_estimated", "title", "project_path",
                 ]
                 writer = csv.DictWriter(buf, fieldnames=fieldnames)
                 writer.writeheader()

@@ -24,6 +24,8 @@ class UsageEvent:
     is_estimated: bool = False
     source_file: str = ""
     duration_ms: int = 0
+    credits: float = 0.0
+    original_credits: float = 0.0
 
     def __post_init__(self) -> None:
         if self.total_tokens <= 0:

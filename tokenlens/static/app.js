@@ -91,6 +91,7 @@ function renderAll(data) {
   $("kpiAgentsCount").textContent = `${(state.selectedAgents || []).length} 款已选`;
   $("kpiSessionsCount").innerHTML = `${fmtNum(kpis.sessions_count)} <small>${fmtNum(kpis.calls_count)} 次请求</small>`;
   $("kpiAvgSession").textContent = `${fmtTokens(kpis.avg_tokens_per_session)} tok`;
+  $("kpiTotalCredits").textContent = kpis.total_credits > 0 ? `${kpis.total_credits.toFixed(1)} 积分` : "0";
 
   renderSidebarAgents(sidebar_agents);
   renderRank(agent_breakdown);
@@ -182,7 +183,7 @@ function renderRank(breakdown) {
       </div>
       <div class="rank-right">
         <div class="rank-tok">${fmtTokens(item.total_tokens)} <span class="muted">(${item.share_pct}%)</span></div>
-        <div class="rank-cost">估算 $${item.cost_usd.toFixed(2)}</div>
+        <div class="rank-cost">${item.credits > 0 ? `${item.credits.toFixed(1)} 积分 · ` : ""}估算 $${item.cost_usd.toFixed(2)}</div>
       </div>
     `;
     row.addEventListener("click", () => {
@@ -267,7 +268,7 @@ function renderSessionsTable(sessions) {
             <td class="num green-text">${fmtTokens(s.cache_read)}</td>
             <td class="num">${fmtTokens(s.output)}</td>
             <td class="num"><b>${fmtTokens(s.total_tokens)}</b></td>
-            <td class="num green-text">$${s.cost_usd.toFixed(3)}</td>
+            <td class="num green-text">${s.credits > 0 ? `${s.credits.toFixed(1)} 积分` : `$${s.cost_usd.toFixed(3)}`}</td>
             <td><button class="btn-mini">明细</button></td>
           </tr>
         `;
