@@ -413,7 +413,7 @@ class TokenLensCoreTest(unittest.TestCase):
                     "message": "[aha_net] send: calling Fetch method=POST, url=http://10.10.1.168:8000/v1/chat/completions, body_len=348",
                 },
             },
-            # 2) 真实对话请求（含 create_agent_task resp_logid + 子 span Fetch）
+            # 2) 真实自定义模型对话（外层 create_agent_task 与内层 CustomModelProxy 同 resp_logid，应去重只保留内层）
             {
                 "span": 2,
                 "time": [2026, 317, 10, 0, 22, 0],
@@ -422,6 +422,14 @@ class TokenLensCoreTest(unittest.TestCase):
                     "session_id": "6af6dfb685ec8ac0a3df5628",
                     "provider": 'Some("custom_openai_compatible")',
                     "config_name": 'Some("qwen3.8-27b")',
+                    "message": "[aha_net] send: calling Fetch id=req_outer, method=POST, url=https://trae-api-cn.mchost.guru/api/agent/v3/create_agent_task, body_len=86076",
+                },
+            },
+            {
+                "span": 2,
+                "time": [2026, 317, 10, 0, 22, 100000000],
+                "fields": {
+                    "trace_id": "shared_ws_trace",
                     "url": "https://api.trae.com.cn/create_agent_task",
                     "resp_logid": "real_req_1",
                     "message": "cloud stream response headers",
@@ -463,6 +471,54 @@ class TokenLensCoreTest(unittest.TestCase):
                     "message": "[CustomModelProxy] sse.end dispatched",
                 },
             },
+            # 3) 官方自带内置云端模型对话（不走 CustomModelProxy，从 create_agent_task 估算）
+            {
+                "span": 30,
+                "time": [2026, 317, 10, 1, 0, 0],
+                "fields": {
+                    "trace_id": "builtin_trace_1",
+                    "chat_session_id": "sess_builtin_1",
+                    "model_name": "DeepSeek-V3.1",
+                    "message": "create_task",
+                },
+            },
+            {
+                "span": 31,
+                "time": [2026, 317, 10, 1, 0, 50000000],
+                "fields": {
+                    "trace_id": "builtin_trace_1",
+                    "message": "[aha_net] send: calling Fetch id=req_builtin, method=POST, url=https://trae-api-cn.mchost.guru/api/agent/v3/create_agent_task, body_len=64000",
+                },
+            },
+            {
+                "span": 30,
+                "time": [2026, 317, 10, 1, 0, 150000000],
+                "fields": {
+                    "trace_id": "builtin_trace_1",
+                    "url": "https://trae-api-cn.mchost.guru/api/agent/v3/create_agent_task",
+                    "resp_logid": "builtin_req_1",
+                    "message": "cloud stream response headers",
+                },
+            },
+            {
+                "span": 30,
+                "time": [2026, 317, 10, 1, 5, 0],
+                "fields": {
+                    "trace_id": "builtin_trace_1",
+                    "history_source": "Server",
+                    "content_source": 'Other("llm_default")',
+                    "message": "recording history entry",
+                },
+            },
+            {
+                "span": 30,
+                "time": [2026, 317, 10, 1, 6, 50000000],
+                "fields": {
+                    "trace_id": "builtin_trace_1",
+                    "status": "Ok(Completed)",
+                    "message": "chat: runner completed",
+                },
+            },
         ]
 
         cbor_stream = b"".join(encode_cbor(r) for r in records)
@@ -489,7 +545,8 @@ class TokenLensCoreTest(unittest.TestCase):
 
             (mod_dir / "ai_agent-0-2026-11-13.alaudalog").write_bytes(alauda_bytes)
             (win_dir / "renderer.log").write_text(
-                '2026-11-13 18:00:32 [info] update session {"chat_session_id":"6af6dfb685ec8ac0a3df5628","title":"你好"}\n',
+                '2026-11-13 18:00:32 [info] update session {"chat_session_id":"6af6dfb685ec8ac0a3df5628","title":"你好"}\n'
+                '2026-11-13 18:01:06 [info] update session {"chat_session_id":"sess_builtin_1","title":"内置模型测试"}\n',
                 encoding="utf-8",
             )
 
@@ -498,16 +555,24 @@ class TokenLensCoreTest(unittest.TestCase):
             ).scan()
 
             self.assertEqual(info.status, "estimated")
-            self.assertEqual(len(events), 1)
-            ev = events[0]
-            self.assertTrue(ev.is_estimated)
-            self.assertEqual(ev.session_id, "Trae CN:6af6dfb685ec8ac0a3df5628")
-            self.assertEqual(ev.model, "custom_openai_compatible//qwen3.8-27b")
-            self.assertEqual(ev.uncached_input, 27544)
-            self.assertEqual(ev.output, 14)
-            self.assertEqual(ev.total_tokens, 27558)
-            self.assertEqual(ev.duration_ms, 7780)
-            self.assertEqual(ev.title, "你好")
+            self.assertEqual(len(events), 2)
+            ev_custom = [e for e in events if "qwen3.8" in e.model][0]
+            self.assertTrue(ev_custom.is_estimated)
+            self.assertEqual(ev_custom.session_id, "Trae CN:6af6dfb685ec8ac0a3df5628")
+            self.assertEqual(ev_custom.model, "custom_openai_compatible//qwen3.8-27b")
+            self.assertEqual(ev_custom.uncached_input, 27544)
+            self.assertEqual(ev_custom.output, 14)
+            self.assertEqual(ev_custom.total_tokens, 27558)
+            self.assertEqual(ev_custom.duration_ms, 7780)
+            self.assertEqual(ev_custom.title, "你好")
+
+            ev_builtin = [e for e in events if e.model == "DeepSeek-V3.1"][0]
+            self.assertTrue(ev_builtin.is_estimated)
+            self.assertEqual(ev_builtin.session_id, "Trae CN:sess_builtin_1")
+            self.assertEqual(ev_builtin.uncached_input, 16000)
+            self.assertEqual(ev_builtin.output, 40)
+            self.assertEqual(ev_builtin.duration_ms, 6000)
+            self.assertEqual(ev_builtin.title, "内置模型测试")
 
 
 if __name__ == "__main__":

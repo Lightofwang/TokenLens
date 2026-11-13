@@ -379,6 +379,7 @@ class TraeAdapter(BaseAdapter):
         span_req_ids: dict[int, str] = {}
         resp_logid_ctx: dict[str, tuple[str, str]] = {}
         custom_calls: dict[int, dict[str, Any]] = {}
+        cloud_tasks: dict[str, list[dict[str, Any]]] = {}
 
         for rec in _iter_cbor_maps(payload):
             span_name = _to_text(rec.get("name"))
@@ -406,6 +407,9 @@ class TraeAdapter(BaseAdapter):
             sess_id = _to_text(fields.get("session_id")) or _to_text(fields.get("chat_session_id"))
             if sess_id and trace_id and not sess_id.startswith("__"):
                 trace_sessions[trace_id] = sess_id
+                for t in cloud_tasks.get(trace_id, ()):
+                    if not t["session_id"]:
+                        t["session_id"] = sess_id
 
             for mkey in ("custom_model_model_name", "custom_model_config_name", "model_name", "config_name"):
                 if mkey in fields:
@@ -416,8 +420,13 @@ class TraeAdapter(BaseAdapter):
                             if prov and prov != "None":
                                 mval = f"{prov}//{mval}"
                         mval = _normalize_model_name(mval)
-                        if trace_id and (trace_id not in trace_models or "//" in mval):
-                            trace_models[trace_id] = mval
+                        if trace_id:
+                            prev_m = trace_models.get(trace_id, "")
+                            if not prev_m or prev_m.lower() == "auto" or "//" in mval:
+                                trace_models[trace_id] = mval
+                                for t in cloud_tasks.get(trace_id, ()):
+                                    if not t["model"] or t["model"].lower() == "auto" or "//" in mval:
+                                        t["model"] = mval
                         break
 
             url_field = _to_text(fields.get("url"))
@@ -428,29 +437,60 @@ class TraeAdapter(BaseAdapter):
                         trace_sessions.get(trace_id, ""),
                         trace_models.get(trace_id, ""),
                     )
+                    if trace_id and trace_id in cloud_tasks:
+                        cloud_tasks[trace_id][-1]["resp_logid"] = resp_logid
                 continue
 
-            if "calling Fetch" in msg and "method=POST" in msg and isinstance(span_id, int):
-                cur: int | None = span_id
-                cm_span: int | None = None
-                while cur is not None:
-                    if cur in span_req_ids:
-                        cm_span = cur
-                        break
-                    cur = span_parents.get(cur)
-                if cm_span is not None:
-                    bm = _FETCH_BODY_LEN_RE.search(msg)
-                    um = _FETCH_URL_RE.search(msg)
-                    if bm and dt is not None:
+            if "calling Fetch" in msg and "method=POST" in msg:
+                um = _FETCH_URL_RE.search(msg)
+                bm = _FETCH_BODY_LEN_RE.search(msg)
+                fetch_url = um.group(1) if um else ""
+                # 1) CustomModelProxy local/custom endpoint call (preferred when present)
+                if isinstance(span_id, int):
+                    cur: int | None = span_id
+                    cm_span: int | None = None
+                    while cur is not None:
+                        if cur in span_req_ids:
+                            cm_span = cur
+                            break
+                        cur = span_parents.get(cur)
+                    if cm_span is not None and bm and dt is not None:
                         custom_calls[cm_span] = {
                             "dt": dt,
                             "request_id": span_req_ids[cm_span],
                             "body_len": int(bm.group(1)),
-                            "url": um.group(1) if um else "",
+                            "url": fetch_url,
                             "sse_messages": 0,
                             "duration_ms": 0,
                         }
+                        continue
+                # 2) Cloud create_agent_task call (captures Trae built-in cloud models too)
+                if trace_id and ("create_agent_task" in fetch_url or "/create_task" in fetch_url) and bm and dt is not None:
+                    cloud_tasks.setdefault(trace_id, []).append(
+                        {
+                            "dt": dt,
+                            "end_dt": None,
+                            "body_len": int(bm.group(1)),
+                            "session_id": trace_sessions.get(trace_id, ""),
+                            "model": trace_models.get(trace_id, ""),
+                            "resp_logid": "",
+                            "server_replies": 0,
+                            "completed": False,
+                        }
+                    )
                 continue
+
+            if trace_id and trace_id in cloud_tasks:
+                cur_task = cloud_tasks[trace_id][-1]
+                if "recording history entry" in msg:
+                    if _to_text(fields.get("history_source")) == "Server" and _to_text(fields.get("content_source")) != "UserInput":
+                        cur_task["server_replies"] += 1
+                elif "resolving explicit Cloud task completion as terminal" in msg or "chat: runner completed" in msg:
+                    status_val = _to_text(fields.get("status"))
+                    if not status_val or ("Err" not in status_val and "Cancel" not in status_val):
+                        cur_task["completed"] = True
+                        if dt is not None:
+                            cur_task["end_dt"] = dt
 
             if isinstance(span_id, int) and span_id in custom_calls:
                 if "SSE stream ended normally after" in msg:
@@ -470,11 +510,13 @@ class TraeAdapter(BaseAdapter):
                             pass
 
         added = 0
+        handled_resp_logids: set[str] = set()
         for call in custom_calls.values():
             ctx = resp_logid_ctx.get(call["request_id"])
             # Skip standalone connectivity checks (small test payload without chat task context)
             if ctx is None:
                 continue
+            handled_resp_logids.add(call["request_id"])
             sid, model = ctx
             sid = sid or call["request_id"]
             model = model or "trae-custom-model"
@@ -505,6 +547,43 @@ class TraeAdapter(BaseAdapter):
                 )
             )
             added += 1
+
+        # Built-in cloud model turns that do not pass through local CustomModelProxy
+        for trace_id, task_list in cloud_tasks.items():
+            for task in task_list:
+                rlogid = task["resp_logid"]
+                if rlogid and rlogid in handled_resp_logids:
+                    continue
+                if not (task["completed"] or rlogid):
+                    continue
+                body_len = int(task["body_len"] or 0)
+                sid = task["session_id"] or trace_sessions.get(trace_id, "")
+                if body_len <= 0 or not sid or sid.startswith("__"):
+                    continue
+                model = task["model"] or trace_models.get(trace_id, "") or "trae-cloud"
+                dur_ms = 0
+                if task["end_dt"] is not None and task["end_dt"] >= task["dt"]:
+                    dur_ms = int((task["end_dt"] - task["dt"]).total_seconds() * 1000)
+                prompt_est = max(1, round(body_len / 4))
+                output_est = max(16, int(task["server_replies"]) * 40, dur_ms // 150)
+                full_sid = f"{app_label}:{sid}"
+                sessions_seen.add(full_sid)
+                events.append(
+                    UsageEvent(
+                        agent_id=self.agent_id,
+                        agent_name=self.agent_name,
+                        session_id=full_sid,
+                        timestamp=task["dt"],
+                        model=model,
+                        uncached_input=prompt_est,
+                        output=output_est,
+                        title=renderer_titles.get(sid) or f"{app_label} {sid[:10]}",
+                        is_estimated=True,
+                        duration_ms=dur_ms,
+                        source_file=str(log_file),
+                    )
+                )
+                added += 1
         return added
 
     def _scan_ai_agent_logs(
@@ -695,7 +774,7 @@ class TraeAdapter(BaseAdapter):
             total_tokens=sum(e.total_tokens for e in events),
             notes=(
                 "Trae / Trae CN 核心对话库 ModularData/ai-agent/database.db 使用 SQLCipher 加密；"
-                "已解析旧版 logs TokenUsageEvent、新版 3.4+ ai_agent*.alaudalog 中的自定义模型请求载荷估算"
-                "（body_len/SSE）以及明文 state.vscdb。"
+                "已解析旧版 logs TokenUsageEvent、新版 3.4+ ai_agent*.alaudalog 中的云端内置模型"
+                "与自定义模型请求载荷估算（create_agent_task/body_len/SSE）以及明文 state.vscdb。"
             ),
         )
