@@ -5,6 +5,7 @@ const state = {
   end: "",
   granularity: "auto",
   chartType: "area",
+  theme: localStorage.getItem("tokenlens-theme") || "dark",
   query: "",
   selectedAgents: null, // null = all
   lastData: null,
@@ -12,6 +13,21 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+
+function applyTheme(theme) {
+  state.theme = theme === "light" ? "light" : "dark";
+  if (state.theme === "light") {
+    document.documentElement.setAttribute("data-theme", "light");
+    $("btnThemeToggle").textContent = "🌙 深色";
+  } else {
+    document.documentElement.removeAttribute("data-theme");
+    $("btnThemeToggle").textContent = "☀️ 浅色";
+  }
+  localStorage.setItem("tokenlens-theme", state.theme);
+  if (state.lastData) {
+    drawTrendChart(state.lastData.timeseries, state.lastData.sidebar_agents);
+  }
+}
 
 function fmtTokens(n) {
   const num = Number(n || 0);
@@ -379,8 +395,9 @@ function drawTrendChart(timeseries, sidebarAgents) {
   maxY = maxY * 1.12;
 
   // Grid lines
-  ctx.strokeStyle = "rgba(148, 163, 184, 0.12)";
-  ctx.fillStyle = "#64748b";
+  const isLight = state.theme === "light";
+  ctx.strokeStyle = isLight ? "rgba(15, 23, 42, 0.08)" : "rgba(148, 163, 184, 0.12)";
+  ctx.fillStyle = isLight ? "#475569" : "#64748b";
   ctx.font = "11px Consolas, monospace";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
@@ -677,6 +694,11 @@ function bindEvents() {
     }, 220);
   });
 
+  // Theme toggle
+  $("btnThemeToggle").addEventListener("click", () => {
+    applyTheme(state.theme === "light" ? "dark" : "light");
+  });
+
   // Rescan
   const doRescan = async () => {
     $("rescanIcon").textContent = "⏳";
@@ -724,6 +746,7 @@ function bindEvents() {
 }
 
 (function init() {
+  applyTheme(state.theme);
   const today = new Date();
   const d7 = new Date(today.getTime() - 6 * 86400 * 1000);
   $("inputSingleDate").value = today.toISOString().slice(0, 10);
