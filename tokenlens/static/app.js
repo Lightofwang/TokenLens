@@ -5,7 +5,7 @@ const state = {
   end: "",
   granularity: "auto",
   chartType: "area",
-  theme: localStorage.getItem("tokenlens-theme") || "dark",
+  theme: localStorage.getItem("tokenlens-theme") || "light",
   query: "",
   selectedAgents: null, // null = all
   lastData: null,
