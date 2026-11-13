@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 from tokenlens.adapters.base import get_app_data_dirs, local_tz
@@ -76,12 +76,13 @@ class TokenLensCoreTest(unittest.TestCase):
         self.assertEqual(ov_none["kpis"]["total_tokens"], 0)
 
     def test_macos_apple_silicon_paths(self) -> None:
+        fake_home = PurePosixPath("/Users/apple_silicon")
         with patch("tokenlens.adapters.base.os.name", "posix"), patch(
             "tokenlens.adapters.base.sys.platform", "darwin"
-        ):
+        ), patch("tokenlens.adapters.base.Path.home", return_value=fake_home):
             dirs = get_app_data_dirs()
-            self.assertEqual(dirs[0], Path.home() / "Library" / "Application Support")
-            self.assertIn(Path.home() / ".local" / "share", dirs)
+            self.assertEqual(dirs[0], fake_home / "Library" / "Application Support")
+            self.assertIn(fake_home / ".local" / "share", dirs)
 
 
 if __name__ == "__main__":
