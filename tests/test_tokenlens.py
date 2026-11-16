@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from tokenlens.adapters.base import get_app_data_dirs, local_tz
 from tokenlens.adapters.claude_code import ClaudeCodeAdapter
+from tokenlens.adapters.cursor import CursorAdapter
 from tokenlens.adapters.trae import TraeAdapter
 from tokenlens.adapters.vscode import VSCodeAdapter
 from tokenlens.models import AgentSourceInfo, UsageEvent
@@ -659,6 +660,215 @@ class TokenLensCoreTest(unittest.TestCase):
             self.assertGreater(by_sid["empty-1"].uncached_input, 800)
             self.assertIn("store-only-1", by_sid)
             self.assertEqual(by_sid["store-only-1"].title, "Store Fallback Session")
+
+    def test_cursor_global_vscdb_legacy_cli_and_transcript_dedup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cursor_app = root / "Cursor" / "User"
+            ws_dir = cursor_app / "workspaceStorage" / "ws_cursor_1"
+            gs_dir = cursor_app / "globalStorage"
+            dot_cursor = root / ".cursor"
+            cli_dir = dot_cursor / "chats" / "projhash" / "cli_sess_1"
+            tr_dir = dot_cursor / "projects" / "proj1" / "agent-transcripts" / "tr_sess_1"
+
+            ws_dir.mkdir(parents=True)
+            gs_dir.mkdir(parents=True)
+            cli_dir.mkdir(parents=True)
+            tr_dir.mkdir(parents=True)
+
+            (ws_dir / "workspace.json").write_text(
+                json.dumps({"folder": "file:///c:/repo/my-cursor-app"}),
+                encoding="utf-8",
+            )
+            ws_conn = sqlite3.connect(str(ws_dir / "state.vscdb"))
+            ws_conn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            ws_conn.execute(
+                "INSERT INTO ItemTable VALUES (?, ?)",
+                (
+                    "composer.composerData",
+                    json.dumps(
+                        {
+                            "allComposers": [
+                                {
+                                    "composerId": "comp_exact",
+                                    "name": "Refactor auth module",
+                                    "createdAt": 1794795000000,
+                                    "lastUpdatedAt": 1794795100000,
+                                }
+                            ]
+                        }
+                    ),
+                ),
+            )
+            ws_conn.execute(
+                "INSERT INTO ItemTable VALUES (?, ?)",
+                (
+                    "workbench.panel.aichat.view.aichat.chatdata",
+                    json.dumps(
+                        {
+                            "tabs": [
+                                {
+                                    "tabId": "tab_legacy_1",
+                                    "chatTitle": "Legacy Chat Panel",
+                                    "lastSendTime": 1794794000000,
+                                    "bubbles": [
+                                        {"type": "user", "text": "Explain decorators"},
+                                        {
+                                            "type": "ai",
+                                            "text": "Decorators wrap functions.",
+                                            "modelType": "gpt-4o",
+                                            "tokenCount": {"inputTokens": 400, "outputTokens": 80, "cacheReadTokens": 100},
+                                        },
+                                    ],
+                                }
+                            ]
+                        }
+                    ),
+                ),
+            )
+            ws_conn.commit()
+            ws_conn.close()
+
+            g_conn = sqlite3.connect(str(gs_dir / "state.vscdb"))
+            g_conn.execute(
+                "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, value TEXT)"
+            )
+            g_conn.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+            g_conn.execute(
+                "INSERT INTO composerHeaders VALUES (?, ?, ?, ?, ?)",
+                ("comp_est", "ws_cursor_1", 1794796000000, 1794796100000, json.dumps({"name": "Fix CSS layout"})),
+            )
+            g_conn.execute(
+                "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                (
+                    "composerData:comp_exact",
+                    json.dumps(
+                        {
+                            "composerId": "comp_exact",
+                            "modelConfig": {"modelName": "claude-4-sonnet"},
+                            "fullConversationHeadersOnly": [
+                                {"bubbleId": "b1", "type": 1},
+                                {"bubbleId": "b2", "type": 2},
+                            ],
+                        }
+                    ),
+                ),
+            )
+            g_conn.execute(
+                "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                ("bubbleId:comp_exact:b1", json.dumps({"type": 1, "text": "重构鉴权中间件", "createdAt": "2026-11-16T02:10:00Z"})),
+            )
+            g_conn.execute(
+                "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                (
+                    "bubbleId:comp_exact:b2",
+                    json.dumps(
+                        {
+                            "type": 2,
+                            "text": "已完成中间件重构。",
+                            "createdAt": "2026-11-16T02:10:15Z",
+                            "modelInfo": {"modelName": "claude-4.5-sonnet"},
+                            "tokenCount": {"inputTokens": 1500, "outputTokens": 250, "cacheReadTokens": 300},
+                        }
+                    ),
+                ),
+            )
+            g_conn.execute(
+                "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                (
+                    "composerData:comp_est",
+                    json.dumps(
+                        {
+                            "composerId": "comp_est",
+                            "modelConfig": {"modelName": "default"},
+                            "fullConversationHeadersOnly": [
+                                {"bubbleId": "e1", "type": 1},
+                                {"bubbleId": "e2", "type": 2},
+                            ],
+                        }
+                    ),
+                ),
+            )
+            g_conn.execute(
+                "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                ("bubbleId:comp_est:e1", json.dumps({"type": 1, "text": "修复 Flex 布局溢出的问题"})),
+            )
+            g_conn.execute(
+                "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                ("bubbleId:comp_est:e2", json.dumps({"type": 2, "text": "请给容器添加 min-width: 0; 与 overflow: hidden;"})),
+            )
+            g_conn.commit()
+            g_conn.close()
+
+            # Cursor Agent CLI store.db with hex-encoded meta JSON
+            s_conn = sqlite3.connect(str(cli_dir / "store.db"))
+            s_conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+            s_conn.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data TEXT)")
+            meta_hex = json.dumps(
+                {"agentId": "cli_sess_1", "name": "CLI Store Task", "createdAt": 1794797000000, "lastUsedModel": "gpt-5"}
+            ).encode("utf-8").hex()
+            s_conn.execute("INSERT INTO meta VALUES ('0', ?)", (meta_hex,))
+            s_conn.execute("INSERT INTO blobs VALUES ('m1', ?)", (json.dumps({"role": "user", "content": "Inspect build.py"}),))
+            s_conn.execute(
+                "INSERT INTO blobs VALUES ('m2', ?)",
+                (json.dumps({"role": "assistant", "content": "Checked build configuration.", "usage": {"inputTokens": 900, "outputTokens": 120}}),),
+            )
+            s_conn.commit()
+            s_conn.close()
+
+            # Agent transcripts jsonl (plus a duplicate of comp_exact that must be deduped)
+            (tr_dir / "tr_sess_1.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"role": "user", "message": {"content": [{"type": "text", "text": "Write unit tests"}]}}),
+                        json.dumps(
+                            {
+                                "role": "assistant",
+                                "message": {
+                                    "model": "grok-4",
+                                    "content": [{"type": "text", "text": "Added comprehensive unit tests in test_app.py."}],
+                                    "usage": {"input_tokens": 600, "output_tokens": 90},
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (tr_dir.parent / "comp_exact.jsonl").write_text(
+                json.dumps({"role": "assistant", "message": {"content": "dup", "usage": {"input_tokens": 9999, "output_tokens": 999}}})
+                + "\n",
+                encoding="utf-8",
+            )
+
+            events, info = CursorAdapter(app_dirs=[root], cursor_dir=dot_cursor).scan()
+            self.assertEqual(info.status, "estimated")
+            self.assertEqual(info.sessions_count, 5)
+            self.assertEqual(len(events), 5)
+
+            by_sid = {e.session_id: e for e in events}
+            self.assertFalse(by_sid["comp_exact"].is_estimated)
+            self.assertEqual(by_sid["comp_exact"].model, "claude-4.5-sonnet")
+            self.assertEqual(by_sid["comp_exact"].total_tokens, 2050)
+            self.assertEqual(by_sid["comp_exact"].project_path, "c:/repo/my-cursor-app")
+            self.assertEqual(by_sid["comp_exact"].title, "Refactor auth module")
+
+            self.assertTrue(by_sid["comp_est"].is_estimated)
+            self.assertEqual(by_sid["comp_est"].model, "cursor-agent")
+            self.assertEqual(by_sid["comp_est"].title, "Fix CSS layout")
+
+            self.assertFalse(by_sid["tab_legacy_1"].is_estimated)
+            self.assertEqual(by_sid["tab_legacy_1"].model, "gpt-4o")
+            self.assertEqual(by_sid["tab_legacy_1"].total_tokens, 580)
+
+            self.assertFalse(by_sid["cli_sess_1"].is_estimated)
+            self.assertEqual(by_sid["cli_sess_1"].model, "gpt-5")
+            self.assertEqual(by_sid["cli_sess_1"].total_tokens, 1020)
+
+            self.assertFalse(by_sid["tr_sess_1"].is_estimated)
+            self.assertEqual(by_sid["tr_sess_1"].model, "grok-4")
+            self.assertEqual(by_sid["tr_sess_1"].total_tokens, 690)
 
 
 if __name__ == "__main__":

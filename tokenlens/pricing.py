@@ -22,6 +22,8 @@ MODEL_PRICING: dict[str, tuple[float, float, float, float]] = {
     "kimi": (0.6, 0.15, 0.6, 2.5),
     "minimax": (0.3, 0.08, 0.3, 1.2),
     "sensenova": (0.3, 0.08, 0.3, 1.0),
+    "grok": (3.0, 0.75, 3.0, 15.0),
+    "cursor-small": (0.2, 0.05, 0.2, 0.8),
 }
 
 DEFAULT_PRICE = (1.50, 0.30, 1.50, 6.00)
@@ -56,6 +58,10 @@ def lookup_price(model: str, custom_pricing: dict[str, Any] | None = None) -> tu
         return MODEL_PRICING["kimi"]
     if "minimax" in m:
         return MODEL_PRICING["minimax"]
+    if "grok" in m:
+        return MODEL_PRICING["grok"]
+    if "cursor-small" in m:
+        return MODEL_PRICING["cursor-small"]
     if "gpt-6" in m:
         return MODEL_PRICING["gpt-6"]
     if "gpt-5" in m:

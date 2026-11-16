@@ -12,6 +12,7 @@
   - **OpenAI Codex** (`~/.codex/sessions` & `archived_sessions/*.jsonl(.zst)` + `state_5.sqlite`)
   - **Claude Code** (`~/.claude/projects/**/*.jsonl`)
   - **OpenCode** (`~/.local/share/opencode/opencode.db`)
+  - **Cursor** (`Cursor/User/globalStorage/state.vscdb`、`~/.cursor/chats/*/store.db`、`agent-transcripts/*.jsonl`)
   - **Qoder / QoderCN / QoderWork CN** (`SharedClientCache/cache/db/local.db` & `agents.db`)
   - **VS Code (GitHub Copilot Chat)** (`Code/User/workspaceStorage/*/chatSessions/*.json(l)`)
   - **Trae / Trae CN** (检测加密 `database.db` 并从明文 `state.vscdb` 进行文本长度估算，带明确“估算”标记)

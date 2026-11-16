@@ -4,6 +4,7 @@ from .antigravity import AntigravityAdapter
 from .base import BaseAdapter
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
+from .cursor import CursorAdapter
 from .opencode import OpenCodeAdapter
 from .qoder import QoderAdapter
 from .trae import TraeAdapter
@@ -15,6 +16,7 @@ ALL_ADAPTERS: list[BaseAdapter] = [
     CodexAdapter(),
     ClaudeCodeAdapter(),
     OpenCodeAdapter(),
+    CursorAdapter(),
     QoderAdapter(),
     VSCodeAdapter(),
     TraeAdapter(),
