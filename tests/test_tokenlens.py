@@ -870,6 +870,62 @@ class TokenLensCoreTest(unittest.TestCase):
             self.assertEqual(by_sid["tr_sess_1"].model, "grok-4")
             self.assertEqual(by_sid["tr_sess_1"].total_tokens, 690)
 
+    def test_cursor_long_session_bounded_context_and_micro_bubble_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            gs_dir = root / "Cursor" / "User" / "globalStorage"
+            gs_dir.mkdir(parents=True)
+            g_conn = sqlite3.connect(str(gs_dir / "state.vscdb"))
+            g_conn.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+
+            # Simulate a heavy session with 120 user turns, each having 5 adjacent micro-bubbles (600 type=2 bubbles)
+            headers = []
+            base_epoch_ms = 1793900000000
+            for t in range(120):
+                t_ms = base_epoch_ms + t * 60_000
+                uid = f"u_{t}"
+                headers.append({"bubbleId": uid, "type": 1})
+                g_conn.execute(
+                    "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                    (f"bubbleId:heavy_1:{uid}", json.dumps({"type": 1, "text": f"Turn {t}: update component props", "createdAt": t_ms})),
+                )
+                for sub in range(5):
+                    aid = f"a_{t}_{sub}"
+                    headers.append({"bubbleId": aid, "type": 2})
+                    g_conn.execute(
+                        "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                        (
+                            f"bubbleId:heavy_1:{aid}",
+                            json.dumps(
+                                {
+                                    "type": 2,
+                                    "text": f"Step {sub} reply content for editing src/App.tsx " * 6,
+                                    "createdAt": t_ms + 1000 + sub * 1000,
+                                }
+                            ),
+                        ),
+                    )
+
+            g_conn.execute(
+                "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                ("composerData:heavy_1", json.dumps({"composerId": "heavy_1", "name": "Heavy Long Session", "fullConversationHeadersOnly": headers})),
+            )
+            g_conn.commit()
+            g_conn.close()
+
+            events, _ = CursorAdapter(app_dirs=[root], cursor_dir=root / ".no_cursor").scan()
+            # 5 adjacent micro-bubbles per turn must merge into 120 events (not 600)
+            self.assertEqual(len(events), 120)
+            # Single-turn input must be capped well below 100K and history reuse splits into cache_read
+            for ev in events:
+                self.assertEqual(ev.uncached_input + ev.cache_read + ev.output, ev.total_tokens)
+                self.assertLess(ev.uncached_input, 40_000)
+                self.assertLessEqual(ev.cache_read, 60_000)
+            # Total tokens across all 120 turns (~20K-70K total input per turn) stays realistic (<10M), never >1B!
+            total = sum(e.total_tokens for e in events)
+            self.assertLess(total, 10_000_000)
+            self.assertGreater(events[-1].cache_read, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

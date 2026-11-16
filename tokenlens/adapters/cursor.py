@@ -62,6 +62,37 @@ def _normalize_cursor_model(raw_model: str | None, fallback: str = "cursor-agent
     return m
 
 
+_CURSOR_SYS_OVERHEAD = 1000
+_CURSOR_MAX_CONTEXT = 80_000
+_CURSOR_MAX_TURN_EXTRA = 16_000
+_MICRO_BUBBLE_MERGE_SECS = 15.0
+
+
+def _estimate_turn_tokens(
+    rolling_ctx: int,
+    extra_ctx: int,
+    out_est: int,
+    sys_overhead: int = _CURSOR_SYS_OVERHEAD,
+) -> tuple[int, int, int]:
+    """Return (uncached_input, cache_read, new_rolling_ctx) without O(N^2) blow-up."""
+    hist = min(max(0, rolling_ctx), _CURSOR_MAX_CONTEXT)
+    extra = min(max(0, extra_ctx), _CURSOR_MAX_TURN_EXTRA)
+    if hist > 0:
+        cache_read = int(hist * 0.75)
+        uncached_in = (hist - cache_read) + extra + sys_overhead
+    else:
+        cache_read = 0
+        uncached_in = extra + sys_overhead
+    # Never compound constant sys_overhead into rolling history
+    new_rolling = min(hist + extra + out_est, _CURSOR_MAX_CONTEXT)
+    return uncached_in, cache_read, new_rolling
+
+
+def _bubble_sort_key(bubble: dict[str, Any]) -> float:
+    dt = parse_iso_dt(bubble.get("createdAt")) or parse_epoch_dt(bubble.get("createdAt"))
+    return dt.timestamp() if dt else 0.0
+
+
 def _extract_bubble_text(bubble: dict[str, Any]) -> tuple[str, str]:
     """Extract (prompt_context_text, assistant_reply_text) from a Cursor bubble object."""
     prompt_parts: list[str] = []
@@ -212,6 +243,8 @@ class CursorAdapter(BaseAdapter):
         rolling_ctx = 0
         title = str(meta.get("title") or "").strip()[:120]
         project_path = str(meta.get("project_path") or "")
+        user_pending = True
+        last_est_event: UsageEvent | None = None
 
         for bubble in bubbles:
             btype = int(bubble.get("type") or 0)
@@ -226,7 +259,10 @@ class CursorAdapter(BaseAdapter):
             cw_tok = int(tc.get("cacheWriteTokens") or 0)
 
             if btype == 1 and in_tok + out_tok + cr_tok + cw_tok == 0:
-                rolling_ctx += estimate_tokens_from_text(prompt_ctx) + 200
+                user_tok = min(estimate_tokens_from_text(prompt_ctx), _CURSOR_MAX_TURN_EXTRA)
+                rolling_ctx = min(rolling_ctx + user_tok + 100, _CURSOR_MAX_CONTEXT)
+                user_pending = True
+                last_est_event = None
                 continue
 
             # Process assistant turns (type == 2) or any bubble carrying explicit tokenCount
@@ -247,7 +283,9 @@ class CursorAdapter(BaseAdapter):
             )
 
             if in_tok + out_tok + cr_tok + cw_tok > 0:
-                rolling_ctx = max(rolling_ctx, in_tok + cr_tok + out_tok)
+                rolling_ctx = min(max(rolling_ctx, in_tok + cr_tok + out_tok), _CURSOR_MAX_CONTEXT)
+                user_pending = False
+                last_est_event = None
                 sessions_seen.add(comp_id)
                 events.append(
                     UsageEvent(
@@ -271,24 +309,41 @@ class CursorAdapter(BaseAdapter):
                 if out_est <= 0:
                     continue
                 extra_ctx = estimate_tokens_from_text(prompt_ctx)
-                prompt_est = max(rolling_ctx + extra_ctx + 1200, 1200)
-                rolling_ctx = prompt_est + out_est
+
+                # Cursor splits single agent turns into many adjacent micro-bubbles
+                # (thinking/text/code/tool stubs); merge adjacent pure-output fragments
+                # within the same turn instead of re-charging full prompt context.
+                if (
+                    last_est_event is not None
+                    and not user_pending
+                    and extra_ctx == 0
+                    and last_est_event.model == model
+                    and 0.0 <= (dt - last_est_event.timestamp).total_seconds() <= _MICRO_BUBBLE_MERGE_SECS
+                ):
+                    last_est_event.output += out_est
+                    last_est_event.total_tokens += out_est
+                    rolling_ctx = min(rolling_ctx + out_est, _CURSOR_MAX_CONTEXT)
+                    continue
+
+                uncached_in, cr_est, rolling_ctx = _estimate_turn_tokens(rolling_ctx, extra_ctx, out_est)
+                user_pending = False
                 sessions_seen.add(comp_id)
-                events.append(
-                    UsageEvent(
-                        agent_id=self.agent_id,
-                        agent_name=self.agent_name,
-                        session_id=comp_id,
-                        timestamp=dt,
-                        model=model,
-                        uncached_input=prompt_est,
-                        output=out_est,
-                        title=title or f"Cursor {comp_id[:8]}",
-                        project_path=project_path,
-                        is_estimated=True,
-                        source_file=str(source_file),
-                    )
+                ev = UsageEvent(
+                    agent_id=self.agent_id,
+                    agent_name=self.agent_name,
+                    session_id=comp_id,
+                    timestamp=dt,
+                    model=model,
+                    uncached_input=uncached_in,
+                    cache_read=cr_est,
+                    output=out_est,
+                    title=title or f"Cursor {comp_id[:8]}",
+                    project_path=project_path,
+                    is_estimated=True,
+                    source_file=str(source_file),
                 )
+                events.append(ev)
+                last_est_event = ev
 
     def _scan_global_vscdb(
         self,
@@ -377,7 +432,7 @@ class CursorAdapter(BaseAdapter):
                         if bid not in seen_bids:
                             ordered_bubbles.append(bobj)
                 elif bmap:
-                    ordered_bubbles = list(bmap.values())
+                    ordered_bubbles = sorted(bmap.values(), key=_bubble_sort_key)
                 elif isinstance(cobj.get("conversation"), list):
                     ordered_bubbles = [b for b in cobj["conversation"] if isinstance(b, dict)]
 
@@ -426,7 +481,8 @@ class CursorAdapter(BaseAdapter):
                 if btype == "user":
                     if not tab_title and text.strip():
                         tab_title = text.strip().replace("\n", " ")[:120]
-                    rolling_ctx += estimate_tokens_from_text(text) + 200
+                    user_tok = min(estimate_tokens_from_text(text), _CURSOR_MAX_TURN_EXTRA)
+                    rolling_ctx = min(rolling_ctx + user_tok + 100, _CURSOR_MAX_CONTEXT)
                     continue
                 if btype != "ai":
                     continue
@@ -438,14 +494,13 @@ class CursorAdapter(BaseAdapter):
                 dt = parse_epoch_dt(b.get("timestamp")) or fallback_dt
 
                 if in_tok + out_tok + cr_tok > 0:
-                    rolling_ctx = max(rolling_ctx, in_tok + cr_tok + out_tok)
+                    rolling_ctx = min(max(rolling_ctx, in_tok + cr_tok + out_tok), _CURSOR_MAX_CONTEXT)
                     is_est = False
                 else:
                     out_tok = estimate_tokens_from_text(text)
                     if out_tok <= 0:
                         continue
-                    in_tok = max(rolling_ctx + 1000, 1000)
-                    rolling_ctx = in_tok + out_tok
+                    in_tok, cr_tok, rolling_ctx = _estimate_turn_tokens(rolling_ctx, 0, out_tok)
                     is_est = True
 
                 sessions_seen.add(tab_id)
@@ -516,21 +571,21 @@ class CursorAdapter(BaseAdapter):
                     if role == "user":
                         if not title and content.strip():
                             title = content.strip().replace("\n", " ")[:120]
-                        rolling_ctx += estimate_tokens_from_text(content) + 200
+                        user_tok = min(estimate_tokens_from_text(content), _CURSOR_MAX_TURN_EXTRA)
+                        rolling_ctx = min(rolling_ctx + user_tok + 100, _CURSOR_MAX_CONTEXT)
                     elif role == "assistant":
                         usage = bobj.get("usage") if isinstance(bobj.get("usage"), dict) else {}
                         in_tok = int(usage.get("inputTokens") or usage.get("input_tokens") or 0)
                         out_tok = int(usage.get("outputTokens") or usage.get("output_tokens") or 0)
                         cr_tok = int(usage.get("cacheReadTokens") or usage.get("cache_read_input_tokens") or 0)
                         if in_tok + out_tok + cr_tok > 0:
-                            rolling_ctx = max(rolling_ctx, in_tok + cr_tok + out_tok)
+                            rolling_ctx = min(max(rolling_ctx, in_tok + cr_tok + out_tok), _CURSOR_MAX_CONTEXT)
                             is_est = False
                         else:
                             out_tok = estimate_tokens_from_text(content)
                             if out_tok <= 0:
                                 continue
-                            in_tok = max(rolling_ctx + 1200, 1200)
-                            rolling_ctx = in_tok + out_tok
+                            in_tok, cr_tok, rolling_ctx = _estimate_turn_tokens(rolling_ctx, 0, out_tok)
                             is_est = True
 
                         sessions_seen.add(sid)
@@ -601,7 +656,8 @@ class CursorAdapter(BaseAdapter):
                 if role == "user":
                     if not title and text.strip():
                         title = text.strip().replace("\n", " ")[:120]
-                    rolling_ctx += estimate_tokens_from_text(text) + 200
+                    user_tok = min(estimate_tokens_from_text(text), _CURSOR_MAX_TURN_EXTRA)
+                    rolling_ctx = min(rolling_ctx + user_tok + 100, _CURSOR_MAX_CONTEXT)
                 elif role == "assistant":
                     usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else (
                         rec.get("usage") if isinstance(rec.get("usage"), dict) else {}
@@ -612,14 +668,13 @@ class CursorAdapter(BaseAdapter):
                     cw_tok = int(usage.get("cache_creation_input_tokens") or usage.get("cacheWriteTokens") or 0)
 
                     if in_tok + out_tok + cr_tok + cw_tok > 0:
-                        rolling_ctx = max(rolling_ctx, in_tok + cr_tok + out_tok)
+                        rolling_ctx = min(max(rolling_ctx, in_tok + cr_tok + out_tok), _CURSOR_MAX_CONTEXT)
                         is_est = False
                     else:
                         out_tok = estimate_tokens_from_text(text)
                         if out_tok <= 0:
                             continue
-                        in_tok = max(rolling_ctx + 1200, 1200)
-                        rolling_ctx = in_tok + out_tok
+                        in_tok, cr_tok, rolling_ctx = _estimate_turn_tokens(rolling_ctx, 0, out_tok)
                         is_est = True
 
                     dt = parse_iso_dt(rec.get("timestamp")) or parse_epoch_dt(rec.get("timestamp")) or fallback_dt
