@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import defaultdict
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from .base import (
     close_sqlite_snapshot,
     local_tz,
     open_sqlite_snapshot,
+    parse_epoch_dt,
     parse_iso_dt,
 )
 
@@ -131,7 +133,7 @@ class ClaudeCodeAdapter(BaseAdapter):
         return file_events
 
     def _scan_cc_switch_rollups(
-        self, db_path: Path, covered_dates: set[date]
+        self, db_path: Path
     ) -> list[UsageEvent]:
         if not db_path.is_file():
             return []
@@ -171,8 +173,6 @@ class ClaudeCodeAdapter(BaseAdapter):
                 row_date = date.fromisoformat(str(date_str))
             except ValueError:
                 continue
-            if row_date in covered_dates:
-                continue
 
             u_inp = int(inp or 0)
             u_out = int(out or 0)
@@ -196,6 +196,76 @@ class ClaudeCodeAdapter(BaseAdapter):
                     output=u_out,
                     title=f"CC-Switch 历史日汇总 ({date_str}, {req_cnt} reqs)",
                     project_path="cc-switch-rollup",
+                    source_file=str(db_path),
+                )
+            )
+        return events
+
+    def _scan_cc_switch_proxy_logs(self, db_path: Path) -> list[UsageEvent]:
+        """Read live per-request logs from CC-Switch's proxy_request_logs.
+
+        On installs where usage_daily_rollups stopped updating, the
+        authoritative live usage lives in proxy_request_logs (one row per
+        request; request_id is the primary key, so no dedup is needed).
+        """
+        if not db_path.is_file():
+            return []
+        conn = open_sqlite_snapshot(db_path)
+        if conn is None:
+            return []
+        events: list[UsageEvent] = []
+        try:
+            rows = conn.execute(
+                """
+                SELECT request_id, model, request_model, pricing_model,
+                       input_tokens, output_tokens, cache_read_tokens,
+                       cache_creation_tokens, session_id, created_at
+                FROM proxy_request_logs
+                WHERE app_type = 'claude'
+                """
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            close_sqlite_snapshot(conn)
+
+        for (
+            req_id,
+            model,
+            request_model,
+            pricing_model,
+            inp,
+            out,
+            cr,
+            cw,
+            session_id,
+            created_at,
+        ) in rows:
+            u_inp = int(inp or 0)
+            u_out = int(out or 0)
+            u_cr = int(cr or 0)
+            u_cw = int(cw or 0)
+            if u_inp + u_out + u_cr + u_cw <= 0:
+                continue
+            dt = parse_epoch_dt(created_at)
+            if not dt:
+                continue
+            model_name = str(
+                model or request_model or pricing_model or "claude-code"
+            )
+            events.append(
+                UsageEvent(
+                    agent_id=self.agent_id,
+                    agent_name=self.agent_name,
+                    session_id=str(session_id or req_id or "ccswitch-proxy"),
+                    timestamp=dt,
+                    model=model_name,
+                    uncached_input=u_inp,
+                    cache_read=u_cr,
+                    cache_write=u_cw,
+                    output=u_out,
+                    title=f"CC-Switch 代理请求 ({dt.strftime('%Y-%m-%d')})",
+                    project_path="cc-switch-proxy",
                     source_file=str(db_path),
                 )
             )
@@ -236,12 +306,39 @@ class ClaudeCodeAdapter(BaseAdapter):
                 jsonl_events.extend(self._scan_jsonl_file(fp))
 
         tz = local_tz()
-        covered_dates = {e.timestamp.astimezone(tz).date() for e in jsonl_events}
         if cc_switch_db.is_file():
             paths_found.append(str(cc_switch_db))
-        rollup_events = self._scan_cc_switch_rollups(cc_switch_db, covered_dates)
+        rollup_events = self._scan_cc_switch_rollups(cc_switch_db)
+        proxy_events = self._scan_cc_switch_proxy_logs(cc_switch_db)
 
-        events = [*jsonl_events, *rollup_events]
+        # Day-level "take the largest" merge across three sources.
+        # CC-Switch sits as a proxy between Claude Code and the upstream API.
+        # usage_daily_rollups is the older aggregate (may be frozen on some
+        # installs); proxy_request_logs is the live per-request table. The
+        # local ~/.claude/projects JSONL only records what the CLI persisted.
+        # For each date, pick whichever source has the largest day-total and
+        # emit only that source's events for the day — this never under-counts
+        # vs CC-Switch while keeping per-request/per-session detail from JSONL
+        # on days where JSONL already captured everything.
+        jsonl_by_date: dict[date, list[UsageEvent]] = defaultdict(list)
+        for e in jsonl_events:
+            jsonl_by_date[e.timestamp.astimezone(tz).date()].append(e)
+        rollup_by_date: dict[date, list[UsageEvent]] = defaultdict(list)
+        for e in rollup_events:
+            rollup_by_date[e.timestamp.astimezone(tz).date()].append(e)
+        proxy_by_date: dict[date, list[UsageEvent]] = defaultdict(list)
+        for e in proxy_events:
+            proxy_by_date[e.timestamp.astimezone(tz).date()].append(e)
+
+        events: list[UsageEvent] = []
+        for d in set(jsonl_by_date) | set(rollup_by_date) | set(proxy_by_date):
+            candidates = (
+                jsonl_by_date.get(d, []),
+                rollup_by_date.get(d, []),
+                proxy_by_date.get(d, []),
+            )
+            best = max(candidates, key=lambda lst: sum(e.total_tokens for e in lst))
+            events.extend(best)
         if not paths_found:
             return events, AgentSourceInfo(
                 agent_id=self.agent_id,
@@ -256,12 +353,12 @@ class ClaudeCodeAdapter(BaseAdapter):
         sessions_seen = {e.session_id for e in events}
         if events:
             status = "exact"
-            if jsonl_events and rollup_events:
-                label = "精确记录 (JSONL + CC-Switch)"
-            elif rollup_events:
-                label = "精确记录 (CC-Switch)"
-            else:
-                label = "精确记录 (JSONL)"
+            src_tags = []
+            if jsonl_events:
+                src_tags.append("JSONL")
+            if rollup_events or proxy_events:
+                src_tags.append("CC-Switch")
+            label = "精确记录 (" + " + ".join(src_tags) + ")" if src_tags else "精确记录"
         else:
             status = "unavailable"
             label = "目录存在但暂无记录"
@@ -278,5 +375,5 @@ class ClaudeCodeAdapter(BaseAdapter):
             events_count=len(events),
             sessions_count=len(sessions_seen),
             total_tokens=sum(e.total_tokens for e in events),
-            notes="读取 ~/.claude/projects/**/*.jsonl（取流式末帧）并对已清理的历史日期回填 CC-Switch usage_daily_rollups。",
+            notes="读取 ~/.claude/projects/**/*.jsonl（取流式末帧）+ CC-Switch usage_daily_rollups + proxy_request_logs，按天取三者最大值，避免本地转录/汇总表冻结导致的漏计。",
         )
